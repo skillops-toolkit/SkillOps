@@ -63,21 +63,28 @@ jobs:
           python3 - <<'PY'
           import ast, hashlib, json, pathlib, re, sys
 
-          FORBIDDEN_ROOT_IMPORTS = {
+          FORBIDDEN_NETWORK_IMPORTS = {
               "urllib2", "urllib3", "httplib", "socket", "socketserver",
               "requests", "httpx", "aiohttp", "ftplib", "smtplib",
               "telnetlib", "paramiko", "websocket", "websockets",
+              "ssl", "webbrowser",
+          }
+          FORBIDDEN_EXEC_IMPORTS = {
               "pickle", "cPickle", "marshal", "shelve", "ctypes", "cffi",
-              "importlib", "builtins", "pty", "commands",
+              "importlib", "builtins", "runpy", "code", "codeop", "zipimport",
+          }
+          FORBIDDEN_SHELL_IMPORTS = {
+              "pty", "commands", "subprocess", "_posixsubprocess",
+              "asyncio", "multiprocessing",
           }
           FORBIDDEN_SUBMODULES = {
               "urllib.request", "urllib.urlopen", "http.client", "xmlrpc.client",
           }
-          FORBIDDEN_CALLS = {"eval", "exec", "__import__"}
+          FORBIDDEN_CALLS = {"eval", "exec", "__import__", "globals", "locals", "vars"}
           FORBIDDEN_OS_ATTRS = {
               "system", "popen", "spawnl", "spawnle", "spawnlp", "spawnlpe",
-              "spawnv", "spawnve", "spawnvp", "spawnvpe", "execl", "execle",
-              "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
+              "spawnv", "spawnve", "spawnvp", "spawnvpe", "posix_spawn", "posix_spawnp",
+              "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
           }
           FORBIDDEN_BINARY_EXTS = {
               ".exe", ".dll", ".so", ".dylib", ".bin", ".wasm", ".pyc", ".pyo",
@@ -88,40 +95,70 @@ jobs:
               ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp",
               ".pdf", ".woff", ".woff2", ".ttf", ".otf", ".eot",
           }
+          MAX_FILE_BYTES = 2 * 1024 * 1024
           TROJAN_BIDI_RE = re.compile(r"[\u0000\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\U000E0000-\U000E007F]")
 
           allowlist_path = pathlib.Path(".skillops-security-allowlist.json")
           allowlist_entries = []
-          if allowlist_path.is_file():
+          if not allowlist_path.is_symlink() and allowlist_path.is_file():
               allowlist_data = json.loads(allowlist_path.read_text(encoding="utf-8"))
-              allowlist_entries = allowlist_data.get("exceptions", [])
+              if isinstance(allowlist_data, dict) and isinstance(allowlist_data.get("exceptions"), list):
+                  allowlist_entries = allowlist_data["exceptions"]
 
-          def is_allowlisted(rel_posix: str, digest: str) -> bool:
+          def is_allowlisted(rel_posix: str, rule_id: str, digest: str) -> bool:
               for entry in allowlist_entries:
-                  if entry.get("relative_path") == rel_posix and entry.get("sha256") == digest:
+                  if not isinstance(entry, dict):
+                      continue
+                  entry_rule = entry.get("rule") or entry.get("rule_id")
+                  entry_rel = entry.get("relative_path")
+                  entry_sha = entry.get("sha256")
+                  if (
+                      isinstance(entry_rel, str)
+                      and isinstance(entry_rule, str)
+                      and isinstance(entry_sha, str)
+                      and entry_rel == rel_posix
+                      and entry_rule == rule_id
+                      and entry_sha.lower() == digest.lower()
+                  ):
                       return True
               return False
 
           errors = []
+
+          def record_finding(rel_posix: str, lineno: int, rule_id: str, digest: str, message: str) -> None:
+              if not is_allowlisted(rel_posix, rule_id, digest):
+                  errors.append(f"{rel_posix}:{lineno}: [{rule_id}] {message}")
+
+          def classify_root_import(root_mod: str) -> str | None:
+              if root_mod in FORBIDDEN_NETWORK_IMPORTS:
+                  return "forbidden-network-import"
+              if root_mod in FORBIDDEN_EXEC_IMPORTS:
+                  return "forbidden-dynamic-exec"
+              if root_mod in FORBIDDEN_SHELL_IMPORTS:
+                  return "forbidden-shell-execution"
+              return None
+
           catalog_root = pathlib.Path("catalog")
 
           for item in sorted(catalog_root.rglob("*")):
               if "__pycache__" in item.parts:
                   continue
               if item.is_symlink():
-                  errors.append(f"{item.as_posix()}:1: forbidden symbolic link in catalog")
+                  errors.append(f"{item.as_posix()}:1: [forbidden-symlink] forbidden symbolic link in catalog")
                   continue
               if item.is_file():
+                  rel_posix = item.as_posix()
                   low = item.name.lower()
                   if low.endswith(".tar.gz") or item.suffix.lower() in FORBIDDEN_BINARY_EXTS:
-                      errors.append(f"{item.as_posix()}:1: forbidden binary or archive file '{item.name}'")
+                      errors.append(f"{rel_posix}:1: [forbidden-binary-file] forbidden binary or archive file '{item.name}'")
                       continue
                   if item.suffix.lower() in SKIP_MEDIA_EXTS:
                       continue
+                  if item.lstat().st_size > MAX_FILE_BYTES:
+                      errors.append(f"{rel_posix}:1: [oversized-file] catalog file exceeds 2 MiB limit")
+                      continue
                   raw_bytes = item.read_bytes()
                   digest = hashlib.sha256(raw_bytes).hexdigest()
-                  if is_allowlisted(item.as_posix(), digest):
-                      continue
                   try:
                       txt = raw_bytes.decode("utf-8")
                   except UnicodeDecodeError:
@@ -130,58 +167,77 @@ jobs:
                       txt = txt[1:]
                   for idx, line in enumerate(txt.splitlines(), 1):
                       if len(line) > 4096:
-                          errors.append(f"{item.as_posix()}:{idx}: suspicious long line ({len(line)} > 4096)")
+                          record_finding(
+                              rel_posix,
+                              idx,
+                              "suspicious-long-line",
+                              digest,
+                              f"suspicious long line ({len(line)} > 4096)",
+                          )
                           continue
                       m = TROJAN_BIDI_RE.search(line)
                       if m:
                           cp = f"U+{ord(m.group(0)):04X}"
-                          errors.append(f"{item.as_posix()}:{idx}: forbidden Trojan-Source / invisible control character {cp}")
+                          record_finding(
+                              rel_posix,
+                              idx,
+                              "forbidden-trojan-unicode",
+                              digest,
+                              f"forbidden Trojan-Source / invisible control character {cp}",
+                          )
 
           for py_file in sorted(catalog_root.rglob("*.py")):
-              if "__pycache__" in py_file.parts:
+              if "__pycache__" in py_file.parts or py_file.is_symlink():
+                  continue
+              rel_posix = py_file.as_posix()
+              if py_file.lstat().st_size > MAX_FILE_BYTES:
                   continue
               raw_bytes = py_file.read_bytes()
               digest = hashlib.sha256(raw_bytes).hexdigest()
-              if is_allowlisted(py_file.as_posix(), digest):
+              try:
+                  source = raw_bytes.decode("utf-8")
+                  tree = ast.parse(source, filename=rel_posix)
+              except (UnicodeDecodeError, SyntaxError) as exc:
+                  errors.append(f"{rel_posix}:1: [python-parse-error] failed parsing Python script: {exc}")
                   continue
-              source = raw_bytes.decode("utf-8")
-              tree = ast.parse(source, filename=py_file.as_posix())
               for node in ast.walk(tree):
                   lineno = getattr(node, "lineno", 1)
                   if isinstance(node, ast.Import):
                       for alias in node.names:
                           root = alias.name.split(".")[0]
                           first_two = ".".join(alias.name.split(".")[:2])
-                          if root in FORBIDDEN_ROOT_IMPORTS:
-                              errors.append(f"{py_file.as_posix()}:{lineno}: forbidden import '{root}'")
+                          root_rule = classify_root_import(root)
+                          if root_rule:
+                              record_finding(rel_posix, lineno, root_rule, digest, f"forbidden import '{root}'")
                           elif first_two in FORBIDDEN_SUBMODULES:
-                              errors.append(f"{py_file.as_posix()}:{lineno}: forbidden network client '{first_two}'")
+                              record_finding(rel_posix, lineno, "forbidden-network-import", digest, f"forbidden network client '{first_two}'")
                   elif isinstance(node, ast.ImportFrom) and node.module:
                       root = node.module.split(".")[0]
                       first_two = ".".join(node.module.split(".")[:2])
                       imported = {a.name for a in node.names}
-                      if root in FORBIDDEN_ROOT_IMPORTS:
-                          errors.append(f"{py_file.as_posix()}:{lineno}: forbidden from-import '{root}'")
+                      root_rule = classify_root_import(root)
+                      if root_rule:
+                          record_finding(rel_posix, lineno, root_rule, digest, f"forbidden from-import '{root}'")
                       elif first_two in FORBIDDEN_SUBMODULES:
-                          errors.append(f"{py_file.as_posix()}:{lineno}: forbidden network client '{first_two}'")
+                          record_finding(rel_posix, lineno, "forbidden-network-import", digest, f"forbidden network client '{first_two}'")
                       elif node.module == "urllib" and (imported & {"request", "urlopen"}):
-                          errors.append(f"{py_file.as_posix()}:{lineno}: forbidden network client 'urllib.request'")
+                          record_finding(rel_posix, lineno, "forbidden-network-import", digest, "forbidden network client 'urllib.request'")
                       elif node.module in {"http", "xmlrpc"} and "client" in imported:
-                          errors.append(f"{py_file.as_posix()}:{lineno}: forbidden network client '{node.module}.client'")
+                          record_finding(rel_posix, lineno, "forbidden-network-import", digest, f"forbidden network client '{node.module}.client'")
                   elif isinstance(node, ast.Call):
                       if isinstance(node.func, ast.Name):
                           fn_name = node.func.id
                           if fn_name in FORBIDDEN_CALLS:
-                              errors.append(f"{py_file.as_posix()}:{lineno}: forbidden dynamic call '{fn_name}()'")
+                              record_finding(rel_posix, lineno, "forbidden-dynamic-exec", digest, f"forbidden dynamic call '{fn_name}()'")
                           elif fn_name == "compile" and (len(node.args) >= 3 or any(kw.arg == "mode" for kw in node.keywords)):
-                              errors.append(f"{py_file.as_posix()}:{lineno}: forbidden dynamic compilation 'compile()'")
-                          elif fn_name == "getattr" and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id in {"__builtins__", "builtins"}:
-                              errors.append(f"{py_file.as_posix()}:{lineno}: forbidden builtins lookup 'getattr({node.args[0].id}, ...)'")
+                              record_finding(rel_posix, lineno, "forbidden-dynamic-exec", digest, "forbidden dynamic compilation 'compile()'")
+                          elif fn_name == "getattr":
+                              record_finding(rel_posix, lineno, "forbidden-dynamic-exec", digest, "forbidden reflection call 'getattr()'")
                       elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "os" and node.func.attr in FORBIDDEN_OS_ATTRS:
-                          errors.append(f"{py_file.as_posix()}:{lineno}: forbidden shell call 'os.{node.func.attr}()'")
+                          record_finding(rel_posix, lineno, "forbidden-shell-execution", digest, f"forbidden shell call 'os.{node.func.attr}()'")
                       for kw in node.keywords:
                           if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
-                              errors.append(f"{py_file.as_posix()}:{lineno}: forbidden 'shell=True' in subprocess call")
+                              record_finding(rel_posix, lineno, "forbidden-shell-execution", digest, "forbidden 'shell=True' in subprocess call")
 
           if errors:
               for err in errors:
@@ -191,11 +247,12 @@ jobs:
           PY
 
   npx-engine-qa:
-    name: Node.js ${{ matrix.node-version }} NPX Engine & TypeScript QA Gate
-    runs-on: ubuntu-latest
+    name: Node.js ${{ matrix.node-version }} (${{ matrix.os }}) NPX Engine & TypeScript QA Gate
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node-version: ["20", "22"]
     steps:
       - name: Checkout Repository
@@ -207,12 +264,21 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: "npm"
 
-      - name: Run TypeScript Lint, Typecheck, Vitest & Build
+      - name: Install Dependencies & Audit Supply Chain
+        shell: bash
         run: |
-          npm ci
+          set -euo pipefail
+          npm ci --ignore-scripts
+          npm audit --omit=dev --audit-level=high
+
+      - name: Run TypeScript Lint, Typecheck, Vitest, Build & Strict Catalog Audit
+        shell: bash
+        run: |
+          set -euo pipefail
           npm run lint
           npm run typecheck
           npm test
           npm run build
-          node dist/cli.js --version
-          node dist/cli.js --help
+          node ./dist/cli.js --version
+          node ./dist/cli.js --help
+          node ./dist/cli.js audit --strict
