@@ -1,29 +1,34 @@
 /**
  * Deterministic Security Scanner for Hybrid Executable Skills & Subagents (`src/auditor/security.ts`).
  *
- * Enforces Step 2 (Issue #190), Step 3 (Issue #191), and Lagune Defense Plan hardening:
- * - Blocks outbound network/exfiltration clients in Python (`urllib.request`, `urllib2`, `urllib3`,
- *   `http.client`, `httplib`, `socket`, `socketserver`, `requests`, `httpx`, `aiohttp`, `ftplib`,
- *   `smtplib`, `telnetlib`, `xmlrpc.client`, `paramiko`, `websocket`, `websockets`) while allowing
- *   offline URL parsers (`urllib.parse`, `urllib.error`) and local preview servers (`http.server`,
- *   `http.cookies`, `http.HTTPStatus`, `webbrowser`).
- * - Blocks dynamic code execution and unsafe deserialization in Python (`eval`, `exec`, `__import__`,
- *   `importlib`, `builtins`, `getattr(__builtins__, ...)`, 3-arg `compile()`, `pickle`, `marshal`,
- *   `shelve`, `ctypes`, `cffi`) while allowing `from re import compile` + `compile(r'...')`,
- *   `def eval()`, and `model.eval()`.
- * - Blocks dangerous Node/Web primitives in JS/TS (`child_process`, `vm`, `worker_threads`, `net`,
- *   `http`, `https`, `http2`, `tls`, `dgram`, `dns`, `undici`, global `fetch()`, `new WebSocket()`,
- *   dynamic `import()`, `eval()`, `Function()`, `process.binding()`, `process.dlopen()`) while
- *   allowing class methods (`async eval(...) { ... }`).
- * - Blocks unsafe shell execution (`os.system`, `os.popen`, `pty`, `subprocess` with `shell=True`,
- *   and shell pipe-to-interpreter / reverse-shell payloads in `.sh` scripts) while allowing safe
- *   array-based `subprocess.run([...])` (`shell=False`) and local `curl` healthchecks.
- * - Blocks Trojan-Source (CVE-2021-42574) bidirectional control characters and LLM invisible Unicode
- *   Tag prompt-injection characters (`U+E0000..U+E007F`) across every UTF-8 text file in a Skill
- *   directory, plus zero-width script identifier spoofing inside executable scripts.
+ * Enforces SkillOps Security Charter Principles I, II, III, V, VI and Lagune Defense Plan controls:
+ * - Blocks outbound network/exfiltration clients, subprocess spawning, and dynamic execution in Python
+ *   (`urllib.request`, `urllib2`, `urllib3`, `http.client`, `httplib`, `socket`, `socketserver`,
+ *   `requests`, `httpx`, `aiohttp`, `ftplib`, `smtplib`, `poplib`, `imaplib`, `ssl`, `telnetlib`,
+ *   `xmlrpc.client`, `paramiko`, `websocket`, `websockets`, `webbrowser`, `subprocess`,
+ *   `_posixsubprocess`, `asyncio`, `multiprocessing`, `pty`, `commands`, `eval`, `exec`, `__import__`,
+ *   `importlib`, `builtins`, `runpy`, `code`, `codeop`, `zipimport`, `pickle`, `marshal`, `shelve`,
+ *   `ctypes`, `cffi`, 3-arg `compile()`, `getattr` reflection, `globals()`, `locals()`, `vars()`,
+ *   module aliases, and `f`-string `{...}` interpolations) while allowing offline stdlib helpers
+ *   (`urllib.parse`, `urllib.error`, `http.server`, `from re import compile` + `compile(r'...')`,
+ *   `def eval()`, and `model.eval()`).
+ * - Blocks dangerous Node/Web primitives and obfuscations in JS/TS (`child_process`, `vm`,
+ *   `worker_threads`, `module`, `inspector`, `v8`, `wasi`, `net`, `http`, `https`, `http2`, `tls`,
+ *   `dgram`, `dns`, `undici`, `\xHH`/`\uHHHH`/`\u{H+}` escaped identifiers and module specifiers,
+ *   non-literal or aliased `require`, dynamic `import()`, `eval()`, `Function()`, `.constructor()`,
+ *   `Reflect.apply`, `Reflect.construct`, `process.binding()`, `process.dlopen()`,
+ *   `process.getBuiltinModule()`, and computed bracket indexing on globals/`process`/`Reflect`)
+ *   while allowing class methods (`async eval(...) { ... }`).
+ * - Blocks outbound network/transfer commands (`curl`, `wget`, `Invoke-WebRequest`, `iwr`, `nc`,
+ *   `ncat`, `socat`, `ssh`, `scp`), dynamic `eval`, subshell/process substitutions (`$(...)`,
+ *   backticks, `<(...)`), `\`-continued pipelines, forbidden `.ps1`/`.bat`/`.cmd` scripts, and
+ *   unexpected `#!` shebang companion files.
+ * - Blocks prompt-injection overrides hidden in HTML comments (`<!-- ... -->`), executable
+ *   `javascript:` / `data:` Markdown links, and external Markdown image beacons (`![...](https://...)`)
+ *   across `SKILL.md`, `SUBAGENT.md`, and `references/*.md`.
  * - Enforces `MAX_SCANNED_LINE_LENGTH` and strictly linear O(n) scanning with zero polynomial regexes.
  * - Never trusts inline comments inside scanned files; maintainer exceptions are loaded exclusively
- *   from `.skillops-security-allowlist.json` when auditing the built-in catalog.
+ *   from a canonical symlink-free `.skillops-security-allowlist.json` inside the built-in package root.
  */
 
 import crypto from "node:crypto";
@@ -33,6 +38,8 @@ import { fileURLToPath } from "node:url";
 import { discoverSkillDirectories, discoverSubagentFiles } from "./parser.js";
 
 export const MAX_SCANNED_LINE_LENGTH = 4096;
+export const MAX_SCANNED_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_ALLOWLIST_BYTES = 1_048_576;
 
 export type SkillSecurityRuleId =
 	| "forbidden-network-import"
@@ -42,7 +49,24 @@ export type SkillSecurityRuleId =
 	| "forbidden-symlink"
 	| "forbidden-binary-file"
 	| "forbidden-path-traversal"
-	| "suspicious-long-line";
+	| "suspicious-long-line"
+	| "oversized-file"
+	| "forbidden-prompt-injection"
+	| "forbidden-external-markdown-image";
+
+const VALID_RULE_IDS: ReadonlySet<SkillSecurityRuleId> = new Set([
+	"forbidden-network-import",
+	"forbidden-dynamic-exec",
+	"forbidden-shell-execution",
+	"forbidden-trojan-unicode",
+	"forbidden-symlink",
+	"forbidden-binary-file",
+	"forbidden-path-traversal",
+	"suspicious-long-line",
+	"oversized-file",
+	"forbidden-prompt-injection",
+	"forbidden-external-markdown-image",
+]);
 
 export interface SkillSecurityFinding {
 	readonly file: string;
@@ -77,8 +101,8 @@ export interface SecurityAuditOptions {
 }
 
 /**
- * Python root modules that are unconditionally forbidden because their sole purpose
- * is outbound network communication, raw sockets, or remote administration.
+ * Python root modules that are unconditionally forbidden because they open network
+ * connections, TLS sockets, mail/FTP sessions, or external browser windows.
  */
 const FORBIDDEN_PYTHON_NETWORK_ROOT_MODULES = new Set([
 	"urllib2",
@@ -86,15 +110,19 @@ const FORBIDDEN_PYTHON_NETWORK_ROOT_MODULES = new Set([
 	"httplib",
 	"socket",
 	"socketserver",
+	"ssl",
 	"requests",
 	"httpx",
 	"aiohttp",
 	"ftplib",
 	"smtplib",
+	"poplib",
+	"imaplib",
 	"telnetlib",
 	"paramiko",
 	"websocket",
 	"websockets",
+	"webbrowser",
 ]);
 
 /**
@@ -117,9 +145,20 @@ const FORBIDDEN_PYTHON_EXEC_MODULES = new Set([
 	"cffi",
 	"importlib",
 	"builtins",
+	"runpy",
+	"code",
+	"codeop",
+	"zipimport",
 ]);
 
-const FORBIDDEN_PYTHON_SHELL_MODULES = new Set(["pty", "commands"]);
+const FORBIDDEN_PYTHON_SHELL_MODULES = new Set([
+	"pty",
+	"commands",
+	"subprocess",
+	"_posixsubprocess",
+	"asyncio",
+	"multiprocessing",
+]);
 
 const FORBIDDEN_PYTHON_OS_CALLS = new Set([
 	"system",
@@ -143,11 +182,48 @@ const FORBIDDEN_PYTHON_OS_CALLS = new Set([
 	"execve",
 	"execvp",
 	"execvpe",
+	"fork",
+	"forkpty",
+]);
+
+const DANGEROUS_PYTHON_REFLECTION_ATTRS = new Set([
+	...FORBIDDEN_PYTHON_OS_CALLS,
+	"eval",
+	"exec",
+	"compile",
+	"__import__",
+	"__builtins__",
+	"builtins",
+	"__globals__",
+	"__subclasses__",
+	"__loader__",
+	"__spec__",
+	"modules",
+	"urlopen",
+	"urlretrieve",
+	"open_code",
+]);
+
+const PYTHON_ALIASABLE_MODULES = new Set([
+	"os",
+	"posix",
+	"nt",
+	"sys",
+	"builtins",
+	"__builtins__",
+	"urllib",
 ]);
 
 const FORBIDDEN_JS_SHELL_MODULES = new Set(["child_process"]);
 
-const FORBIDDEN_JS_EXEC_MODULES = new Set(["vm", "worker_threads"]);
+const FORBIDDEN_JS_EXEC_MODULES = new Set([
+	"vm",
+	"worker_threads",
+	"module",
+	"inspector",
+	"v8",
+	"wasi",
+]);
 
 const FORBIDDEN_JS_NETWORK_MODULES = new Set([
 	"net",
@@ -162,6 +238,14 @@ const FORBIDDEN_JS_NETWORK_MODULES = new Set([
 
 const GLOBAL_JS_OBJECTS = new Set(["globalThis", "global", "window", "self"]);
 
+const FORBIDDEN_PROCESS_METHODS = new Set([
+	"binding",
+	"dlopen",
+	"getBuiltinModule",
+	"mainModule",
+	"_load",
+]);
+
 const SHELL_PIPE_INTERPRETERS = new Set([
 	"sh",
 	"bash",
@@ -175,6 +259,8 @@ const SHELL_PIPE_INTERPRETERS = new Set([
 	"perl",
 	"ruby",
 	"eval",
+	"pwsh",
+	"powershell",
 ]);
 
 const BASE64_PIPE_INTERPRETERS = new Set([
@@ -188,6 +274,43 @@ const BASE64_PIPE_INTERPRETERS = new Set([
 	"python3",
 	"node",
 	"eval",
+	"pwsh",
+	"powershell",
+]);
+
+const FORBIDDEN_SHELL_NETWORK_COMMANDS = new Set([
+	"curl",
+	"wget",
+	"invoke-webrequest",
+	"invoke-restmethod",
+	"iwr",
+	"irm",
+	"socat",
+	"ssh",
+	"scp",
+	"sftp",
+	"ftp",
+	"telnet",
+]);
+
+const FORBIDDEN_SHELL_SUBINTERPRETERS = new Set([
+	"sh",
+	"bash",
+	"zsh",
+	"dash",
+	"ksh",
+	"pwsh",
+	"powershell",
+]);
+
+const SHELL_COMMAND_WRAPPERS = new Set([
+	"sudo",
+	"env",
+	"command",
+	"builtin",
+	"nohup",
+	"time",
+	"exec",
 ]);
 
 const IGNORED_SCAN_DIRS = new Set([
@@ -202,7 +325,7 @@ const IGNORED_SCAN_DIRS = new Set([
 const IGNORED_SCAN_FILES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
 
 /**
- * Opaque compiled binary and archive extensions forbidden inside curated Skill directories
+ * Opaque compiled binary and archive extensions forbidden inside curated Skill and catalog directories
  * because they cannot be audited line-by-line in GitHub Pull Request diffs.
  */
 export const FORBIDDEN_BINARY_AND_ARCHIVE_EXTENSIONS = new Set([
@@ -251,16 +374,38 @@ const NON_TEXT_MEDIA_EXTENSIONS = new Set([
 	".webm",
 ]);
 
-const KNOWN_TEXT_EXTENSIONS = new Set([
-	".md",
-	".mdc",
-	".py",
-	".sh",
+const PYTHON_SCRIPT_EXTENSIONS = new Set([".py", ".pyw"]);
+
+const SHELL_SCRIPT_EXTENSIONS = new Set([".sh", ".bash", ".zsh", ".ksh"]);
+
+const JS_TS_SCRIPT_EXTENSIONS = new Set([
 	".mjs",
 	".js",
 	".cjs",
+	".mts",
+	".cts",
 	".ts",
 	".tsx",
+	".jsx",
+]);
+
+const FORBIDDEN_COMPANION_SCRIPT_EXTENSIONS = new Set([
+	".ps1",
+	".bat",
+	".cmd",
+]);
+
+const EXECUTABLE_SCRIPT_EXTENSIONS = new Set([
+	...PYTHON_SCRIPT_EXTENSIONS,
+	...SHELL_SCRIPT_EXTENSIONS,
+	...JS_TS_SCRIPT_EXTENSIONS,
+	...FORBIDDEN_COMPANION_SCRIPT_EXTENSIONS,
+]);
+
+const KNOWN_TEXT_EXTENSIONS = new Set([
+	".md",
+	".mdc",
+	...EXECUTABLE_SCRIPT_EXTENSIONS,
 	".json",
 	".yaml",
 	".yml",
@@ -274,16 +419,6 @@ const KNOWN_TEXT_EXTENSIONS = new Set([
 	".css",
 ]);
 
-const EXECUTABLE_SCRIPT_EXTENSIONS = new Set([
-	".py",
-	".sh",
-	".mjs",
-	".js",
-	".cjs",
-	".ts",
-	".tsx",
-]);
-
 /**
  * Trojan-Source (CVE-2021-42574) bidirectional control characters, mid-file BOM (`U+FEFF`),
  * and LLM ASCII-smuggling Unicode Tag characters (`U+E0000..U+E007F`), forbidden across ALL UTF-8 text files.
@@ -292,10 +427,40 @@ const TROJAN_BIDI_OR_TAG_REGEX =
 	/[\u0000\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/u;
 
 /**
- * Zero-width characters forbidden inside executable scripts (`.py`, `.sh`, `.js`, `.mjs`, `.cjs`, `.ts`, `.tsx`)
- * where they can spoof identifiers or hide payload boundaries.
+ * Zero-width characters forbidden inside executable scripts where they can spoof identifiers
+ * or hide payload boundaries.
  */
 const SCRIPT_ZERO_WIDTH_REGEX = /[\u200B-\u200D\u2060-\u2064\uFEFF]/u;
+
+const SHA256_HEX_REGEX = /^[0-9a-f]{64}$/;
+const DEV_SOCKET_REGEX = /\/dev\/(?:tcp|udp)\//;
+
+function trimLeadingSlashes(value: string): string {
+	let idx = 0;
+	while (idx < value.length && value[idx] === "/") {
+		idx += 1;
+	}
+	return idx === 0 ? value : value.slice(idx);
+}
+
+function hasUnsafePathSyntax(rawPath: string): boolean {
+	for (let i = 0; i < rawPath.length; i++) {
+		const code = rawPath.charCodeAt(i);
+		if (code < 0x20 || code === 0x7f) {
+			return true;
+		}
+		if (rawPath[i] === ":") {
+			const isWindowsDrivePrefix =
+				i === 1 &&
+				((rawPath.charCodeAt(0) >= 65 && rawPath.charCodeAt(0) <= 90) ||
+					(rawPath.charCodeAt(0) >= 97 && rawPath.charCodeAt(0) <= 122));
+			if (!isWindowsDrivePrefix) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
 
 function resolveBuiltinPackageRoot(): string {
 	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -325,6 +490,234 @@ function isPathInsideBuiltinCatalog(resolvedTarget: string): boolean {
 	}
 }
 
+/**
+ * Verify that an allowlist file resides strictly inside `pkgRoot` with zero symbolic-link
+ * ancestor segments (`lstatSync`) and canonical `realpathSync` containment.
+ */
+function resolveSafeAllowlistFile(
+	rawCandidatePath: string,
+	pkgRoot: string,
+): string | null {
+	if (!rawCandidatePath || hasUnsafePathSyntax(rawCandidatePath)) {
+		return null;
+	}
+	const resolvedPkg = path.resolve(pkgRoot);
+	const resolvedCandidate = path.resolve(rawCandidatePath);
+	if (!fs.existsSync(resolvedPkg) || !fs.existsSync(resolvedCandidate)) {
+		return null;
+	}
+
+	try {
+		const pkgLstat = fs.lstatSync(resolvedPkg);
+		if (pkgLstat.isSymbolicLink() || !pkgLstat.isDirectory()) {
+			return null;
+		}
+		const realPkg = fs.realpathSync(resolvedPkg);
+		const lexicalRel = path.relative(resolvedPkg, resolvedCandidate);
+		if (
+			lexicalRel === "" ||
+			lexicalRel.startsWith("..") ||
+			path.isAbsolute(lexicalRel)
+		) {
+			return null;
+		}
+
+		// Walk every ancestor segment from `resolvedPkg` down to `resolvedCandidate`
+		const segments = lexicalRel.split(path.sep).filter(Boolean);
+		let current = resolvedPkg;
+		for (const seg of segments) {
+			current = path.join(current, seg);
+			const st = fs.lstatSync(current);
+			if (st.isSymbolicLink()) {
+				return null;
+			}
+		}
+
+		const finalStat = fs.lstatSync(resolvedCandidate);
+		if (
+			finalStat.isSymbolicLink() ||
+			!finalStat.isFile() ||
+			finalStat.size > MAX_ALLOWLIST_BYTES
+		) {
+			return null;
+		}
+
+		const realCandidate = fs.realpathSync(resolvedCandidate);
+		const canonicalRel = path.relative(realPkg, realCandidate);
+		if (
+			canonicalRel === "" ||
+			canonicalRel.startsWith("..") ||
+			path.isAbsolute(canonicalRel)
+		) {
+			return null;
+		}
+
+		return realCandidate;
+	} catch {
+		return null;
+	}
+}
+
+type BoundedFileReadResult =
+	| { readonly ok: true; readonly buffer: Buffer }
+	| { readonly ok: false; readonly finding: SkillSecurityFinding };
+
+/**
+ * Safely read a regular, non-symlink file bounded by `maxBytes`.
+ * Verifies `lstatSync` before opening, opens with `O_RDONLY | O_NOFOLLOW` where available,
+ * re-verifies `fstatSync(fd)` on the open descriptor, and reads at most `maxBytes + 1` bytes
+ * to prevent heap exhaustion or concurrent TOCTOU file growth.
+ */
+function readBoundedRegularFile(
+	fullPath: string,
+	relFile: string,
+	contextLabel: string,
+	maxBytes: number = MAX_SCANNED_FILE_BYTES,
+): BoundedFileReadResult {
+	let lstat: fs.Stats;
+	try {
+		lstat = fs.lstatSync(fullPath);
+	} catch {
+		return {
+			ok: false,
+			finding: {
+				file: relFile,
+				line: 1,
+				rule: "forbidden-binary-file",
+				symbol: "unreadable-file",
+				message: `Unable to stat file '${relFile}' in ${contextLabel}.`,
+			},
+		};
+	}
+
+	if (lstat.isSymbolicLink()) {
+		return {
+			ok: false,
+			finding: {
+				file: relFile,
+				line: 1,
+				rule: "forbidden-symlink",
+				symbol: "symlink",
+				message: `Forbidden symbolic link '${relFile}' in ${contextLabel}.`,
+			},
+		};
+	}
+
+	if (!lstat.isFile()) {
+		return {
+			ok: false,
+			finding: {
+				file: relFile,
+				line: 1,
+				rule: "forbidden-binary-file",
+				symbol: "non-regular-file",
+				message: `Forbidden non-regular file '${relFile}' in ${contextLabel}.`,
+			},
+		};
+	}
+
+	if (lstat.size > maxBytes) {
+		return {
+			ok: false,
+			finding: {
+				file: relFile,
+				line: 1,
+				rule: "oversized-file",
+				symbol: `>${maxBytes}B`,
+				message: `File '${relFile}' (${lstat.size} bytes) exceeds maximum scanned file size (${maxBytes} bytes).`,
+			},
+		};
+	}
+
+	const openFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+	let fd: number;
+	try {
+		fd = fs.openSync(fullPath, openFlags);
+	} catch {
+		return {
+			ok: false,
+			finding: {
+				file: relFile,
+				line: 1,
+				rule: "forbidden-symlink",
+				symbol: "unopenable-file",
+				message: `Refusing to scan '${relFile}' in ${contextLabel}: failed to open regular file safely.`,
+			},
+		};
+	}
+
+	try {
+		const fstat = fs.fstatSync(fd);
+		if (!fstat.isFile()) {
+			return {
+				ok: false,
+				finding: {
+					file: relFile,
+					line: 1,
+					rule: "forbidden-binary-file",
+					symbol: "non-regular-file",
+					message: `Forbidden non-regular file '${relFile}' in ${contextLabel}.`,
+				},
+			};
+		}
+
+		if (fstat.size > maxBytes) {
+			return {
+				ok: false,
+				finding: {
+					file: relFile,
+					line: 1,
+					rule: "oversized-file",
+					symbol: `>${maxBytes}B`,
+					message: `File '${relFile}' (${fstat.size} bytes) exceeds maximum scanned file size (${maxBytes} bytes).`,
+				},
+			};
+		}
+
+		const maxToRead = maxBytes + 1;
+		const initialCap = Math.min(Math.max(fstat.size + 1, 64), maxToRead);
+		let buf = Buffer.allocUnsafe(initialCap);
+		let totalRead = 0;
+
+		while (totalRead < maxToRead) {
+			if (totalRead === buf.length) {
+				const nextCap = Math.min(buf.length * 2, maxToRead);
+				const grown = Buffer.allocUnsafe(nextCap);
+				buf.copy(grown, 0, 0, totalRead);
+				buf = grown;
+			}
+			const bytesRead = fs.readSync(
+				fd,
+				buf,
+				totalRead,
+				buf.length - totalRead,
+				null,
+			);
+			if (bytesRead === 0) {
+				break;
+			}
+			totalRead += bytesRead;
+		}
+
+		if (totalRead > maxBytes) {
+			return {
+				ok: false,
+				finding: {
+					file: relFile,
+					line: 1,
+					rule: "oversized-file",
+					symbol: `>${maxBytes}B`,
+					message: `File '${relFile}' exceeds maximum scanned file size (${maxBytes} bytes) during read.`,
+				},
+			};
+		}
+
+		return { ok: true, buffer: buf.subarray(0, totalRead) };
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
 function loadBuiltinAllowlistEntries(
 	resolvedTarget: string,
 	options?: SecurityAuditOptions,
@@ -336,18 +729,24 @@ function loadBuiltinAllowlistEntries(
 		return [];
 	}
 	const pkgRoot = resolveBuiltinPackageRoot();
-	const candidatePath = options?.allowlistPath
-		? path.resolve(options.allowlistPath)
+	const rawCandidate = options?.allowlistPath
+		? options.allowlistPath
 		: path.join(pkgRoot, ".skillops-security-allowlist.json");
-	if (!fs.existsSync(candidatePath)) {
+	const safeAllowlistPath = resolveSafeAllowlistFile(rawCandidate, pkgRoot);
+	if (!safeAllowlistPath) {
 		return [];
 	}
 	try {
-		const lstat = fs.lstatSync(candidatePath);
-		if (lstat.isSymbolicLink() || !lstat.isFile()) {
+		const bounded = readBoundedRegularFile(
+			safeAllowlistPath,
+			".skillops-security-allowlist.json",
+			"allowlist",
+			MAX_ALLOWLIST_BYTES,
+		);
+		if (!bounded.ok) {
 			return [];
 		}
-		const raw = fs.readFileSync(candidatePath, "utf-8");
+		const raw = bounded.buffer.toString("utf-8");
 		const parsed = JSON.parse(raw) as {
 			exceptions?: Array<{
 				relative_path?: unknown;
@@ -364,7 +763,7 @@ function loadBuiltinAllowlistEntries(
 		for (const item of parsed.exceptions) {
 			const relPath =
 				typeof item?.relative_path === "string"
-					? item.relative_path.replace(/\\/g, "/").replace(/^\/+/, "")
+					? trimLeadingSlashes(item.relative_path.replace(/\\/g, "/"))
 					: "";
 			const ruleVal =
 				typeof item?.rule === "string"
@@ -374,7 +773,12 @@ function loadBuiltinAllowlistEntries(
 						: "";
 			const sha =
 				typeof item?.sha256 === "string" ? item.sha256.toLowerCase() : "";
-			if (relPath && ruleVal && /^[0-9a-f]{64}$/.test(sha)) {
+			if (
+				relPath &&
+				!relPath.includes("..") &&
+				VALID_RULE_IDS.has(ruleVal as SkillSecurityRuleId) &&
+				SHA256_HEX_REGEX.test(sha)
+			) {
 				entries.push({
 					relative_path: relPath,
 					rule: ruleVal as SkillSecurityRuleId,
@@ -395,26 +799,39 @@ function isFindingCoveredByAllowlist(
 	rule: SkillSecurityRuleId,
 	fileSha256: string,
 ): boolean {
-	if (entries.length === 0) {
+	if (entries.length === 0 || !SHA256_HEX_REGEX.test(fileSha256)) {
 		return false;
 	}
-	const pkgRoot = resolveBuiltinPackageRoot();
-	const builtinCatalog = path.join(pkgRoot, "catalog");
-	const relToPkg = path.relative(pkgRoot, fullFilePath).replace(/\\/g, "/");
-	const relToCatalog = path
-		.relative(builtinCatalog, fullFilePath)
-		.replace(/\\/g, "/");
-
-	for (const entry of entries) {
+	try {
+		const pkgRoot = fs.realpathSync(resolveBuiltinPackageRoot());
+		const builtinCatalog = fs.realpathSync(path.join(pkgRoot, "catalog"));
+		const realFile = fs.realpathSync(fullFilePath);
+		const relToPkg = path.relative(pkgRoot, realFile).replace(/\\/g, "/");
+		const relToCatalog = path
+			.relative(builtinCatalog, realFile)
+			.replace(/\\/g, "/");
 		if (
-			entry.rule === rule &&
-			entry.sha256 === fileSha256 &&
-			(entry.relative_path === relToPkg || entry.relative_path === relToCatalog)
+			relToCatalog === "" ||
+			relToCatalog.startsWith("..") ||
+			path.isAbsolute(relToCatalog)
 		) {
-			return true;
+			return false;
 		}
+
+		for (const entry of entries) {
+			if (
+				entry.rule === rule &&
+				entry.sha256 === fileSha256 &&
+				(entry.relative_path === relToPkg ||
+					entry.relative_path === relToCatalog)
+			) {
+				return true;
+			}
+		}
+		return false;
+	} catch {
+		return false;
 	}
-	return false;
 }
 
 function makeLongLineFinding(
@@ -508,6 +925,727 @@ export function scanTextForTrojanUnicode(
 	return findings;
 }
 
+const PROMPT_OVERRIDE_TARGETS = new Set([
+	"previous",
+	"prior",
+	"above",
+	"earlier",
+	"system",
+	"developer",
+	"safety",
+	"guardrail",
+	"guardrails",
+	"instruction",
+	"instructions",
+	"prompt",
+	"prompts",
+	"rule",
+	"rules",
+	"guideline",
+	"guidelines",
+	"constraint",
+	"constraints",
+]);
+
+const OVERRIDE_MODIFIER_PREFIXES = new Set([
+	"system",
+	"developer",
+	"admin",
+	"security",
+	"safety",
+]);
+
+function extractAsciiWordsBounded(text: string, maxChars = 8192): string[] {
+	const words: string[] = [];
+	const limit = Math.min(text.length, maxChars);
+	let current = "";
+	for (let i = 0; i < limit; i++) {
+		const code = text.charCodeAt(i);
+		if (code >= 65 && code <= 90) {
+			current += String.fromCharCode(code + 32);
+		} else if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) {
+			current += text[i]!;
+		} else if (current.length > 0) {
+			words.push(current);
+			current = "";
+		}
+	}
+	if (current.length > 0) {
+		words.push(current);
+	}
+	return words;
+}
+
+function hasHiddenCommentOverrideDirective(commentBody: string): boolean {
+	const words = extractAsciiWordsBounded(commentBody);
+	for (let i = 0; i < words.length; i++) {
+		const w = words[i]!;
+		if (w === "jailbreak" || w === "exfiltrate") {
+			return true;
+		}
+		if (w === "ignore" || w === "disregard" || w === "forget") {
+			const windowEnd = Math.min(words.length, i + 5);
+			for (let j = i + 1; j < windowEnd; j++) {
+				if (PROMPT_OVERRIDE_TARGETS.has(words[j]!)) {
+					return true;
+				}
+			}
+		}
+		if (w === "override") {
+			if (i > 0 && OVERRIDE_MODIFIER_PREFIXES.has(words[i - 1]!)) {
+				return true;
+			}
+			const windowEnd = Math.min(words.length, i + 5);
+			for (let j = i + 1; j < windowEnd; j++) {
+				if (PROMPT_OVERRIDE_TARGETS.has(words[j]!)) {
+					return true;
+				}
+			}
+		}
+		if (
+			w === "bypass" &&
+			i + 1 < words.length &&
+			(words[i + 1] === "safety" ||
+				words[i + 1] === "security" ||
+				words[i + 1] === "guardrails" ||
+				words[i + 1] === "guardrail")
+		) {
+			return true;
+		}
+		if (
+			(w === "new" || w === "reveal" || w === "dump" || w === "leak") &&
+			words[i + 1] === "system" &&
+			(words[i + 2] === "prompt" || words[i + 2] === "instructions")
+		) {
+			return true;
+		}
+		if (
+			w === "do" &&
+			words[i + 1] === "anything" &&
+			words[i + 2] === "now"
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function isHexDigitCode(code: number): boolean {
+	return (
+		(code >= 48 && code <= 57) ||
+		(code >= 65 && code <= 70) ||
+		(code >= 97 && code <= 102)
+	);
+}
+
+function normalizeUriSchemePrefix(rawTarget: string): string {
+	const limit = Math.min(rawTarget.length, 160);
+	let decoded = "";
+	let i = 0;
+	while (i < limit && decoded.length < 48) {
+		const ch = rawTarget[i]!;
+		const code = ch.charCodeAt(0);
+		if (code <= 0x20 || code === 0x7f) {
+			i += 1;
+			continue;
+		}
+		// Decode `%XX` percent-encoded ASCII characters
+		if (
+			ch === "%" &&
+			i + 2 < limit &&
+			isHexDigitCode(rawTarget.charCodeAt(i + 1)) &&
+			isHexDigitCode(rawTarget.charCodeAt(i + 2))
+		) {
+			const byteVal = Number.parseInt(rawTarget.slice(i + 1, i + 3), 16);
+			if (byteVal > 0x20 && byteVal < 0x7f) {
+				decoded += String.fromCharCode(byteVal).toLowerCase();
+			}
+			i += 3;
+			continue;
+		}
+		// Decode numeric/named HTML entities (`&#58;`, `&#x3a;`, `&colon;`)
+		if (ch === "&") {
+			const semi = rawTarget.indexOf(";", i + 1);
+			if (semi !== -1 && semi - i <= 10) {
+				const entity = rawTarget.slice(i + 1, semi).toLowerCase();
+				if (entity === "colon") {
+					decoded += ":";
+					i = semi + 1;
+					continue;
+				}
+				if (entity.startsWith("#x")) {
+					const hexStr = entity.slice(2);
+					if (hexStr.length > 0 && hexStr.length <= 6) {
+						const cp = Number.parseInt(hexStr, 16);
+						if (!Number.isNaN(cp) && cp > 0x20 && cp < 0x7f) {
+							decoded += String.fromCharCode(cp).toLowerCase();
+						}
+						i = semi + 1;
+						continue;
+					}
+				} else if (entity.startsWith("#")) {
+					const decStr = entity.slice(1);
+					if (decStr.length > 0 && decStr.length <= 7) {
+						const cp = Number.parseInt(decStr, 10);
+						if (!Number.isNaN(cp) && cp > 0x20 && cp < 0x7f) {
+							decoded += String.fromCharCode(cp).toLowerCase();
+						}
+						i = semi + 1;
+						continue;
+					}
+				}
+			}
+		}
+		decoded += ch.toLowerCase();
+		i += 1;
+	}
+	return decoded;
+}
+
+function classifyMarkdownUriViolation(
+	rawTarget: string,
+	isImage: boolean,
+): { rule: SkillSecurityRuleId; symbol: string; message: string } | null {
+	const trimmed = rawTarget.trim();
+	if (!trimmed) {
+		return null;
+	}
+	const scheme = normalizeUriSchemePrefix(trimmed);
+	if (scheme.startsWith("javascript:")) {
+		return {
+			rule: "forbidden-prompt-injection",
+			symbol: "javascript:",
+			message: "Forbidden executable 'javascript:' URI in Markdown content.",
+		};
+	}
+	if (scheme.startsWith("vbscript:")) {
+		return {
+			rule: "forbidden-prompt-injection",
+			symbol: "vbscript:",
+			message: "Forbidden executable 'vbscript:' URI in Markdown content.",
+		};
+	}
+	if (scheme.startsWith("data:text/html")) {
+		return {
+			rule: "forbidden-prompt-injection",
+			symbol: "data:text/html",
+			message: "Forbidden executable 'data:text/html' URI in Markdown content.",
+		};
+	}
+	if (scheme.startsWith("data:text/javascript")) {
+		return {
+			rule: "forbidden-prompt-injection",
+			symbol: "data:text/javascript",
+			message:
+				"Forbidden executable 'data:text/javascript' URI in Markdown content.",
+		};
+	}
+	if (scheme.startsWith("data:application/")) {
+		return {
+			rule: "forbidden-prompt-injection",
+			symbol: "data:application/",
+			message:
+				"Forbidden executable 'data:application/' URI in Markdown content.",
+		};
+	}
+	if (isImage) {
+		if (scheme.startsWith("https://")) {
+			return {
+				rule: "forbidden-external-markdown-image",
+				symbol: "https://",
+				message:
+					"Forbidden external Markdown image URL ('https://'); agent instructions must not embed remote image beacons.",
+			};
+		}
+		if (scheme.startsWith("http://")) {
+			return {
+				rule: "forbidden-external-markdown-image",
+				symbol: "http://",
+				message:
+					"Forbidden external Markdown image URL ('http://'); agent instructions must not embed remote image beacons.",
+			};
+		}
+		if (scheme.startsWith("//")) {
+			return {
+				rule: "forbidden-external-markdown-image",
+				symbol: "//",
+				message:
+					"Forbidden protocol-relative external Markdown image URL ('//'); agent instructions must not embed remote image beacons.",
+			};
+		}
+	}
+	return null;
+}
+
+function maskMarkdownInlineCodeSpans(line: string): string {
+	let out = "";
+	let i = 0;
+	const n = line.length;
+	while (i < n) {
+		if (line[i] === "\\" && i + 1 < n) {
+			out += line.slice(i, i + 2);
+			i += 2;
+			continue;
+		}
+		if (line[i] === "`") {
+			let tickLen = 0;
+			while (i + tickLen < n && line[i + tickLen] === "`") {
+				tickLen += 1;
+			}
+			// Find matching backtick run of identical length
+			let closePos = -1;
+			let scan = i + tickLen;
+			while (scan < n) {
+				if (line[scan] === "`") {
+					let run = 0;
+					while (scan + run < n && line[scan + run] === "`") {
+						run += 1;
+					}
+					if (run === tickLen) {
+						closePos = scan;
+						break;
+					}
+					scan += run;
+				} else {
+					scan += 1;
+				}
+			}
+			if (closePos !== -1) {
+				const spanTotal = closePos + tickLen - i;
+				out += " ".repeat(spanTotal);
+				i = closePos + tickLen;
+				continue;
+			}
+			out += "`".repeat(tickLen);
+			i += tickLen;
+			continue;
+		}
+		out += line[i]!;
+		i += 1;
+	}
+	return out;
+}
+
+function findLineForOffset(lineStarts: readonly number[], offset: number): number {
+	let lo = 0;
+	let hi = lineStarts.length - 1;
+	while (lo <= hi) {
+		const mid = (lo + hi) >>> 1;
+		if (lineStarts[mid]! <= offset) {
+			lo = mid + 1;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	return Math.max(1, hi + 1);
+}
+
+function parseMarkdownFencePrefix(
+	line: string,
+): { char: "`" | "~"; count: number; hasRestNonSpace: boolean } | null {
+	let idx = 0;
+	while (idx < 3 && idx < line.length && line[idx] === " ") {
+		idx += 1;
+	}
+	const ch = line[idx];
+	if (ch !== "`" && ch !== "~") {
+		return null;
+	}
+	let count = 0;
+	while (idx + count < line.length && line[idx + count] === ch) {
+		count += 1;
+	}
+	if (count < 3) {
+		return null;
+	}
+	const rest = line.slice(idx + count).trim();
+	// In CommonMark, backtick info strings cannot contain backticks
+	if (ch === "`" && rest.includes("`")) {
+		return null;
+	}
+	return { char: ch, count, hasRestNonSpace: rest.length > 0 };
+}
+
+function scanHtmlTagsOnLineForUris(
+	relFile: string,
+	lineNo: number,
+	cleanLine: string,
+	findings: SkillSecurityFinding[],
+): void {
+	let pos = 0;
+	const n = cleanLine.length;
+	while (pos < n) {
+		const lt = cleanLine.indexOf("<", pos);
+		if (lt === -1) break;
+		const gt = cleanLine.indexOf(">", lt + 1);
+		if (gt === -1) break;
+		const inner = cleanLine.slice(lt + 1, gt).trim();
+		pos = gt + 1;
+		if (!inner || inner.startsWith("!") || inner.startsWith("/")) {
+			continue;
+		}
+
+		// Autolink `<javascript:alert(1)>` or `<data:text/html,...>`
+		if (!inner.includes(" ") && !inner.includes("\t") && inner.includes(":")) {
+			const autoViolation = classifyMarkdownUriViolation(inner, false);
+			if (autoViolation) {
+				findings.push({ file: relFile, line: lineNo, ...autoViolation });
+			}
+			continue;
+		}
+
+		// HTML element `<img src="...">` / `<a href="...">` / `<iframe src="...">`
+		let tagEnd = 0;
+		while (
+			tagEnd < inner.length &&
+			inner[tagEnd] !== " " &&
+			inner[tagEnd] !== "\t" &&
+			inner[tagEnd] !== "/"
+		) {
+			tagEnd += 1;
+		}
+		const tagName = inner.slice(0, tagEnd).toLowerCase();
+		const isImg = tagName === "img";
+		let attrIdx = tagEnd;
+		while (attrIdx < inner.length) {
+			while (
+				attrIdx < inner.length &&
+				(inner[attrIdx] === " " || inner[attrIdx] === "\t")
+			) {
+				attrIdx += 1;
+			}
+			const nameStart = attrIdx;
+			while (
+				attrIdx < inner.length &&
+				inner[attrIdx] !== "=" &&
+				inner[attrIdx] !== " " &&
+				inner[attrIdx] !== "\t"
+			) {
+				attrIdx += 1;
+			}
+			const attrName = inner.slice(nameStart, attrIdx).toLowerCase();
+			while (
+				attrIdx < inner.length &&
+				(inner[attrIdx] === " " || inner[attrIdx] === "\t")
+			) {
+				attrIdx += 1;
+			}
+			if (inner[attrIdx] !== "=") {
+				continue;
+			}
+			attrIdx += 1;
+			while (
+				attrIdx < inner.length &&
+				(inner[attrIdx] === " " || inner[attrIdx] === "\t")
+			) {
+				attrIdx += 1;
+			}
+			let attrVal = "";
+			const quote = inner[attrIdx];
+			if (quote === '"' || quote === "'") {
+				attrIdx += 1;
+				const closeQuote = inner.indexOf(quote, attrIdx);
+				if (closeQuote === -1) {
+					attrVal = inner.slice(attrIdx);
+					attrIdx = inner.length;
+				} else {
+					attrVal = inner.slice(attrIdx, closeQuote);
+					attrIdx = closeQuote + 1;
+				}
+			} else {
+				const valStart = attrIdx;
+				while (
+					attrIdx < inner.length &&
+					inner[attrIdx] !== " " &&
+					inner[attrIdx] !== "\t" &&
+					inner[attrIdx] !== "/"
+				) {
+					attrIdx += 1;
+				}
+				attrVal = inner.slice(valStart, attrIdx);
+			}
+			if (attrName === "href" || attrName === "src") {
+				const v = classifyMarkdownUriViolation(
+					attrVal,
+					isImg && attrName === "src",
+				);
+				if (v) {
+					findings.push({ file: relFile, line: lineNo, ...v });
+				}
+			}
+		}
+	}
+}
+
+/**
+ * Deterministically scan Markdown instructions (`SKILL.md`, `SUBAGENT.md`, `references/*.md`)
+ * in linear O(n) time for HTML-comment override directives, executable `javascript:`/`data:`
+ * links, and external Markdown image beacons (`![...](http/https/...)`).
+ */
+export function scanMarkdownForPromptInjection(
+	relFile: string,
+	rawContent: string,
+): SkillSecurityFinding[] {
+	const findings: SkillSecurityFinding[] = [];
+	const rawLines = rawContent.split(/\r?\n/);
+	const boundedLines: string[] = [];
+	const lineStarts: number[] = [];
+	let currentOffset = 0;
+
+	for (let idx = 0; idx < rawLines.length; idx++) {
+		const rawLine = rawLines[idx] ?? "";
+		lineStarts.push(currentOffset);
+		if (rawLine.length > MAX_SCANNED_LINE_LENGTH) {
+			findings.push(makeLongLineFinding(relFile, idx + 1, rawLine.length));
+			boundedLines.push("");
+			currentOffset += 1;
+		} else {
+			boundedLines.push(rawLine);
+			currentOffset += rawLine.length + 1;
+		}
+	}
+
+	const safeDoc = boundedLines.join("\n");
+
+	// 1. Scan single-line and multi-line HTML comments `<!-- ... -->` in O(n) time
+	let searchPos = 0;
+	while (searchPos < safeDoc.length) {
+		const openIdx = safeDoc.indexOf("<!--", searchPos);
+		if (openIdx === -1) {
+			break;
+		}
+		const closeIdx = safeDoc.indexOf("-->", openIdx + 4);
+		const bodyEnd = closeIdx === -1 ? safeDoc.length : closeIdx;
+		const commentBody = safeDoc.slice(openIdx + 4, bodyEnd);
+		if (hasHiddenCommentOverrideDirective(commentBody)) {
+			const commentLine = findLineForOffset(lineStarts, openIdx);
+			findings.push({
+				file: relFile,
+				line: commentLine,
+				rule: "forbidden-prompt-injection",
+				symbol: "<!-- prompt-override -->",
+				message: `Forbidden prompt-injection override directive hidden inside HTML comment in '${relFile}'.`,
+			});
+		}
+		searchPos = closeIdx === -1 ? safeDoc.length : closeIdx + 3;
+	}
+
+	// 2. Scan Markdown links, images, reference definitions, and HTML tags outside code fences/spans
+	let fenceChar: "`" | "~" | null = null;
+	let fenceCount = 0;
+	const refDefinitions = new Map<string, { target: string; line: number }>();
+	const refImageUsages: Array<{ refKey: string; line: number }> = [];
+
+	for (let idx = 0; idx < boundedLines.length; idx++) {
+		const line = boundedLines[idx]!;
+		const lineNo = idx + 1;
+		if (!line) continue;
+
+		const fence = parseMarkdownFencePrefix(line);
+		if (fence) {
+			if (fenceChar === null) {
+				fenceChar = fence.char;
+				fenceCount = fence.count;
+				continue;
+			}
+			if (
+				fence.char === fenceChar &&
+				fence.count >= fenceCount &&
+				!fence.hasRestNonSpace
+			) {
+				fenceChar = null;
+				fenceCount = 0;
+				continue;
+			}
+		}
+		if (fenceChar !== null) {
+			continue;
+		}
+
+		const cleanLine = maskMarkdownInlineCodeSpans(line);
+
+		// Reference-style link/image definition: `   [id]: https://...`
+		const trimmedStart = cleanLine.trimStart();
+		const leadingSpaces = cleanLine.length - trimmedStart.length;
+		if (leadingSpaces <= 3 && trimmedStart.startsWith("[")) {
+			const closeRef = trimmedStart.indexOf("]:");
+			if (closeRef > 1) {
+				const refId = trimmedStart.slice(1, closeRef).trim().toLowerCase();
+				let restTarget = trimmedStart.slice(closeRef + 2).trim();
+				if (restTarget.startsWith("<")) {
+					const closeAngle = restTarget.indexOf(">");
+					restTarget =
+						closeAngle !== -1
+							? restTarget.slice(1, closeAngle)
+							: restTarget.slice(1);
+				} else {
+					let endTarget = 0;
+					while (
+						endTarget < restTarget.length &&
+						restTarget[endTarget] !== " " &&
+						restTarget[endTarget] !== "\t"
+					) {
+						endTarget += 1;
+					}
+					restTarget = restTarget.slice(0, endTarget);
+				}
+				if (refId && restTarget) {
+					refDefinitions.set(refId, { target: restTarget, line: lineNo });
+					const defViolation = classifyMarkdownUriViolation(restTarget, false);
+					if (defViolation) {
+						findings.push({ file: relFile, line: lineNo, ...defViolation });
+					}
+				}
+			}
+		}
+
+		// Inline links `[label](target)` and images `![alt](target)` / `![alt][ref]`
+		let i = 0;
+		const n = cleanLine.length;
+		while (i < n) {
+			if (cleanLine[i] === "\\" && i + 1 < n) {
+				i += 2;
+				continue;
+			}
+			if (cleanLine[i] === "[") {
+				const isImage =
+					i > 0 &&
+					cleanLine[i - 1] === "!" &&
+					!(i >= 2 && cleanLine[i - 2] === "\\");
+				// Find matching unescaped `]`
+				let bracketDepth = 1;
+				let j = i + 1;
+				while (j < n && bracketDepth > 0) {
+					if (cleanLine[j] === "\\") {
+						j += 2;
+						continue;
+					}
+					if (cleanLine[j] === "[") {
+						bracketDepth += 1;
+					} else if (cleanLine[j] === "]") {
+						bracketDepth -= 1;
+						if (bracketDepth === 0) break;
+					}
+					j += 1;
+				}
+				if (bracketDepth === 0 && j < n) {
+					const labelText = cleanLine.slice(i + 1, j);
+					if (j + 1 < n && cleanLine[j + 1] === "(") {
+						let k = j + 2;
+						while (k < n && (cleanLine[k] === " " || cleanLine[k] === "\t")) {
+							k += 1;
+						}
+						let target = "";
+						if (cleanLine[k] === "<") {
+							const closeAngle = cleanLine.indexOf(">", k + 1);
+							if (closeAngle !== -1) {
+								target = cleanLine.slice(k + 1, closeAngle);
+								const closeParen = cleanLine.indexOf(")", closeAngle + 1);
+								i = closeParen !== -1 ? closeParen + 1 : closeAngle + 1;
+							} else {
+								i = j + 2;
+							}
+						} else {
+							const targetStart = k;
+							let parenDepth = 0;
+							while (k < n) {
+								const c = cleanLine[k]!;
+								if (c === "\\" && k + 1 < n) {
+									k += 2;
+									continue;
+								}
+								if (c === "(") {
+									parenDepth += 1;
+								} else if (c === ")") {
+									if (parenDepth === 0) break;
+									parenDepth -= 1;
+								} else if (
+									parenDepth === 0 &&
+									(c === " " || c === "\t")
+								) {
+									break;
+								}
+								k += 1;
+							}
+							target = cleanLine.slice(targetStart, k);
+							const closeParen = cleanLine.indexOf(")", k);
+							i = closeParen !== -1 ? closeParen + 1 : k + 1;
+						}
+						const violation = classifyMarkdownUriViolation(target, isImage);
+						if (violation) {
+							findings.push({ file: relFile, line: lineNo, ...violation });
+						}
+						continue;
+					}
+					// Reference-style image `![alt][ref]` or `![ref][]` or `![ref]`
+					if (isImage) {
+						if (j + 1 < n && cleanLine[j + 1] === "[") {
+							const closeSecond = cleanLine.indexOf("]", j + 2);
+							if (closeSecond !== -1) {
+								const rawRef = cleanLine.slice(j + 2, closeSecond).trim();
+								const refKey = (rawRef || labelText).trim().toLowerCase();
+								if (refKey) {
+									refImageUsages.push({ refKey, line: lineNo });
+								}
+								i = closeSecond + 1;
+								continue;
+							}
+						} else if (cleanLine[j + 1] !== ":") {
+							const refKey = labelText.trim().toLowerCase();
+							if (refKey) {
+								refImageUsages.push({ refKey, line: lineNo });
+							}
+						}
+					}
+				}
+			}
+			i += 1;
+		}
+
+		// HTML `<img src="...">` / `<a href="...">` / `<javascript:...>`
+		scanHtmlTagsOnLineForUris(relFile, lineNo, cleanLine, findings);
+	}
+
+	for (const usage of refImageUsages) {
+		const def = refDefinitions.get(usage.refKey);
+		if (def) {
+			const imgViolation = classifyMarkdownUriViolation(def.target, true);
+			if (
+				imgViolation &&
+				imgViolation.rule === "forbidden-external-markdown-image"
+			) {
+				findings.push({
+					file: relFile,
+					line: usage.line,
+					...imgViolation,
+				});
+			}
+		}
+	}
+
+	return findings;
+}
+
+function shouldScanMarkdownPromptInjection(relFile: string): boolean {
+	const normalized = relFile.replace(/\\/g, "/");
+	const lower = normalized.toLowerCase();
+	const base = path.posix.basename(lower);
+	if (base === "skill.md" || base === "subagent.md") {
+		return true;
+	}
+	if (lower.endsWith(".md") || lower.endsWith(".mdc")) {
+		if (
+			lower.startsWith("references/") ||
+			lower.includes("/references/") ||
+			lower.startsWith("subagents/") ||
+			lower.includes("/subagents/")
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
 function classifyPythonModuleImport(
 	modulePath: string,
 	importedNames: readonly string[] = [],
@@ -572,7 +1710,10 @@ function classifyPythonModuleImport(
 		}
 	}
 
-	if (rootMod === "os" && parts.length === 1) {
+	if (
+		(rootMod === "os" || rootMod === "posix" || rootMod === "nt") &&
+		parts.length === 1
+	) {
 		for (const name of importedNames) {
 			if (FORBIDDEN_PYTHON_OS_CALLS.has(name)) {
 				return {
@@ -596,7 +1737,7 @@ function classifyPythonModuleImport(
 		return {
 			rule: "forbidden-shell-execution",
 			symbol: rootMod,
-			message: `Forbidden terminal/shell module '${rootMod}' imported in Skill script.`,
+			message: `Forbidden subprocess/shell module '${rootMod}' imported in Skill script (violates zero-subprocess policy).`,
 		};
 	}
 
@@ -640,7 +1781,106 @@ const PYTHON_STRING_PREFIXES = new Set([
 	"rf",
 	"br",
 	"rb",
+	"t",
+	"tr",
+	"rt",
 ]);
+
+function decodePythonStringEscape(
+	source: string,
+	slashIdx: number,
+): { decoded: string; nextIdx: number; lineDelta: number } {
+	const n = source.length;
+	const k = slashIdx + 1;
+	if (k >= n) {
+		return { decoded: "\\", nextIdx: k, lineDelta: 0 };
+	}
+	const esc = source[k]!;
+	if (esc === "\n") {
+		return { decoded: "", nextIdx: k + 1, lineDelta: 1 };
+	}
+	if (esc === "\r") {
+		if (source[k + 1] === "\n") {
+			return { decoded: "", nextIdx: k + 2, lineDelta: 1 };
+		}
+		return { decoded: "", nextIdx: k + 1, lineDelta: 0 };
+	}
+	if (
+		esc === "x" &&
+		k + 2 < n &&
+		isHexDigitCode(source.charCodeAt(k + 1)) &&
+		isHexDigitCode(source.charCodeAt(k + 2))
+	) {
+		const cp = Number.parseInt(source.slice(k + 1, k + 3), 16);
+		return { decoded: String.fromCodePoint(cp), nextIdx: k + 3, lineDelta: 0 };
+	}
+	if (esc === "u" && k + 4 < n) {
+		const hex4 = source.slice(k + 1, k + 5);
+		let allHex = true;
+		for (let h = 0; h < 4; h++) {
+			if (!isHexDigitCode(hex4.charCodeAt(h))) {
+				allHex = false;
+				break;
+			}
+		}
+		if (allHex) {
+			return {
+				decoded: String.fromCharCode(Number.parseInt(hex4, 16)),
+				nextIdx: k + 5,
+				lineDelta: 0,
+			};
+		}
+	}
+	if (esc === "U" && k + 8 < n) {
+		const hex8 = source.slice(k + 1, k + 9);
+		let allHex = true;
+		for (let h = 0; h < 8; h++) {
+			if (!isHexDigitCode(hex8.charCodeAt(h))) {
+				allHex = false;
+				break;
+			}
+		}
+		if (allHex) {
+			const cp = Number.parseInt(hex8, 16);
+			if (cp <= 0x10ffff) {
+				return {
+					decoded: String.fromCodePoint(cp),
+					nextIdx: k + 9,
+					lineDelta: 0,
+				};
+			}
+		}
+	}
+	// Octal `\ooo` (1..3 octal digits)
+	if (esc >= "0" && esc <= "7") {
+		let octEnd = k + 1;
+		while (
+			octEnd < n &&
+			octEnd < k + 3 &&
+			source[octEnd]! >= "0" &&
+			source[octEnd]! <= "7"
+		) {
+			octEnd += 1;
+		}
+		const cp = Number.parseInt(source.slice(k, octEnd), 8);
+		return {
+			decoded: String.fromCodePoint(cp),
+			nextIdx: octEnd,
+			lineDelta: 0,
+		};
+	}
+	if (esc === "n") return { decoded: "\n", nextIdx: k + 1, lineDelta: 0 };
+	if (esc === "r") return { decoded: "\r", nextIdx: k + 1, lineDelta: 0 };
+	if (esc === "t") return { decoded: "\t", nextIdx: k + 1, lineDelta: 0 };
+	return { decoded: esc, nextIdx: k + 1, lineDelta: 0 };
+}
+
+interface ActivePythonFString {
+	readonly quote: string;
+	readonly isRaw: boolean;
+	readonly baseParenDepth: number;
+	readonly inFormatSpec: boolean;
+}
 
 function tokenizePython(source: string): PyToken[] {
 	const tokens: PyToken[] = [];
@@ -648,54 +1888,178 @@ function tokenizePython(source: string): PyToken[] {
 	let i = 0;
 	let line = 1;
 	let parenDepth = 0;
+	const fstringStack: ActivePythonFString[] = [];
 
-	const consumePythonString = (startLine: number): void => {
+	const consumePlainPythonString = (startLine: number, isRaw: boolean): void => {
 		const next3 = source.slice(i, i + 3);
-		if (next3 === '"""' || next3 === "'''") {
-			const quote = next3;
-			i += 3;
-			while (i < n && source.slice(i, i + 3) !== quote) {
-				if (source[i] === "\\") {
+		const quote =
+			next3 === '"""' || next3 === "'''" ? next3 : source[i]!;
+		const isTriple = quote.length === 3;
+		i += quote.length;
+		let val = "";
+		while (i < n) {
+			if (isTriple ? source.slice(i, i + 3) === quote : source[i] === quote) {
+				i += quote.length;
+				tokens.push({ kind: "string", value: val, line: startLine });
+				return;
+			}
+			if (!isTriple && source[i] === "\n") {
+				tokens.push({ kind: "string", value: val, line: startLine });
+				return;
+			}
+			if (source[i] === "\\") {
+				if (isRaw) {
+					val += "\\";
 					i += 1;
 					if (i < n) {
-						if (source[i] === "\n") {
-							line += 1;
-						}
+						if (source[i] === "\n") line += 1;
+						val += source[i]!;
+						i += 1;
+					}
+				} else {
+					const esc = decodePythonStringEscape(source, i);
+					val += esc.decoded;
+					line += esc.lineDelta;
+					i = esc.nextIdx;
+				}
+				continue;
+			}
+			if (source[i] === "\n") {
+				line += 1;
+			}
+			val += source[i]!;
+			i += 1;
+		}
+		tokens.push({ kind: "string", value: val, line: startLine });
+	};
+
+	const scanFStringLiteralSegment = (quote: string, isRaw: boolean): void => {
+		const startLine = line;
+		const isTriple = quote.length === 3;
+		let val = "";
+		while (i < n) {
+			if (isTriple ? source.slice(i, i + 3) === quote : source[i] === quote) {
+				i += quote.length;
+				tokens.push({ kind: "string", value: val, line: startLine });
+				return;
+			}
+			if (!isTriple && source[i] === "\n") {
+				tokens.push({ kind: "string", value: val, line: startLine });
+				return;
+			}
+			// Escaped literal braces `{{` and `}}`
+			if (source[i] === "{" && source[i + 1] === "{") {
+				val += "{";
+				i += 2;
+				continue;
+			}
+			if (source[i] === "}" && source[i + 1] === "}") {
+				val += "}";
+				i += 2;
+				continue;
+			}
+			// Unescaped `{` begins an embedded Python expression
+			if (source[i] === "{") {
+				i += 1;
+				tokens.push({ kind: "string", value: val, line: startLine });
+				tokens.push({ kind: "punct", value: "+", line });
+				parenDepth += 1;
+				tokens.push({ kind: "punct", value: "(", line });
+				fstringStack.push({
+					quote,
+					isRaw,
+					baseParenDepth: parenDepth,
+					inFormatSpec: false,
+				});
+				return;
+			}
+			if (source[i] === "\\") {
+				// Named Unicode escape `\N{name}` in non-raw f-strings is NOT an expression
+				if (!isRaw && source.slice(i, i + 3) === "\\N{") {
+					i += 3;
+					while (
+						i < n &&
+						source[i] !== "}" &&
+						source[i] !== "\n" &&
+						source[i] !== quote[0]
+					) {
+						i += 1;
+					}
+					if (i < n && source[i] === "}") {
 						i += 1;
 					}
 					continue;
 				}
-				if (source[i] === "\n") {
-					line += 1;
-				}
-				i += 1;
-			}
-			if (i < n) {
-				i += 3;
-			}
-			tokens.push({ kind: "string", value: '""', line: startLine });
-			return;
-		}
-
-		const quote = source[i]!;
-		i += 1;
-		while (i < n && source[i] !== quote && source[i] !== "\n") {
-			if (source[i] === "\\") {
-				i += 1;
-				if (i < n) {
-					if (source[i] === "\n") {
-						line += 1;
-					}
+				// Do NOT swallow `{` after `\` in Python f-strings (`f"\{expr}"` still evaluates `{expr}`)
+				if (source[i + 1] === "{") {
+					val += "\\";
 					i += 1;
+					continue;
+				}
+				if (isRaw) {
+					val += "\\";
+					i += 1;
+					if (i < n) {
+						if (source[i] === "\n") line += 1;
+						val += source[i]!;
+						i += 1;
+					}
+				} else {
+					const esc = decodePythonStringEscape(source, i);
+					val += esc.decoded;
+					line += esc.lineDelta;
+					i = esc.nextIdx;
 				}
 				continue;
 			}
+			if (source[i] === "\n") {
+				line += 1;
+			}
+			val += source[i]!;
 			i += 1;
 		}
-		if (i < n && source[i] === quote) {
+		tokens.push({ kind: "string", value: val, line: startLine });
+	};
+
+	const scanFStringFormatSpec = (): void => {
+		const parent = fstringStack[fstringStack.length - 1];
+		if (!parent) return;
+		const isTriple = parent.quote.length === 3;
+		while (i < n) {
+			if (!isTriple && source[i] === "\n") {
+				return;
+			}
+			// Nested `{expr}` inside format spec (`f"{val:{eval('8')}d}"`)
+			if (source[i] === "{") {
+				i += 1;
+				tokens.push({ kind: "punct", value: "+", line });
+				parenDepth += 1;
+				tokens.push({ kind: "punct", value: "(", line });
+				fstringStack.push({
+					quote: parent.quote,
+					isRaw: parent.isRaw,
+					baseParenDepth: parenDepth,
+					inFormatSpec: true,
+				});
+				return;
+			}
+			// Closing `}` of the outer f-string interpolation
+			if (source[i] === "}") {
+				fstringStack.pop();
+				if (parenDepth > 0) {
+					parenDepth -= 1;
+				}
+				tokens.push({ kind: "punct", value: ")", line });
+				tokens.push({ kind: "punct", value: "+", line });
+				i += 1;
+				scanFStringLiteralSegment(parent.quote, parent.isRaw);
+				return;
+			}
+			if (source[i] === "\n") {
+				line += 1;
+			}
 			i += 1;
 		}
-		tokens.push({ kind: "string", value: '""', line: startLine });
 	};
 
 	while (i < n) {
@@ -740,6 +2104,46 @@ function tokenizePython(source: string): PyToken[] {
 			continue;
 		}
 
+		// Handle active f-string interpolation boundaries before normal punctuation
+		if (fstringStack.length > 0) {
+			const top = fstringStack[fstringStack.length - 1]!;
+			if (parenDepth === top.baseParenDepth) {
+				if (ch === "}") {
+					fstringStack.pop();
+					if (parenDepth > 0) {
+						parenDepth -= 1;
+					}
+					tokens.push({ kind: "punct", value: ")", line });
+					tokens.push({ kind: "punct", value: "+", line });
+					i += 1;
+					if (top.inFormatSpec) {
+						scanFStringFormatSpec();
+					} else {
+						scanFStringLiteralSegment(top.quote, top.isRaw);
+					}
+					continue;
+				}
+				// `!r` / `!s` / `!a` conversion specifier (distinct from `!=`)
+				if (
+					ch === "!" &&
+					source[i + 1] !== "=" &&
+					(source[i + 1] === "r" ||
+						source[i + 1] === "s" ||
+						source[i + 1] === "a") &&
+					(source[i + 2] === ":" || source[i + 2] === "}")
+				) {
+					i += 2;
+					continue;
+				}
+				// `:format_spec` introducer (distinct from `:=` walrus operator)
+				if (ch === ":" && source[i + 1] !== "=" && !top.inFormatSpec) {
+					i += 1;
+					scanFStringFormatSpec();
+					continue;
+				}
+			}
+		}
+
 		// Comment until end of physical line (`\` inside comment never continues the comment)
 		if (ch === "#") {
 			while (i < n && source[i] !== "\n") {
@@ -749,7 +2153,7 @@ function tokenizePython(source: string): PyToken[] {
 		}
 
 		if (ch === '"' || ch === "'") {
-			consumePythonString(line);
+			consumePlainPythonString(line, false);
 			continue;
 		}
 
@@ -760,13 +2164,25 @@ function tokenizePython(source: string): PyToken[] {
 				i += 1;
 			}
 			const ident = source.slice(start, i);
+			const lowerIdent = ident.toLowerCase();
 			if (
 				ident.length <= 2 &&
-				PYTHON_STRING_PREFIXES.has(ident.toLowerCase()) &&
+				PYTHON_STRING_PREFIXES.has(lowerIdent) &&
 				i < n &&
 				(source[i] === '"' || source[i] === "'")
 			) {
-				consumePythonString(startLine);
+				const isRaw = lowerIdent.includes("r");
+				const isFormatted =
+					lowerIdent.includes("f") || lowerIdent.includes("t");
+				if (isFormatted) {
+					const next3 = source.slice(i, i + 3);
+					const quote =
+						next3 === '"""' || next3 === "'''" ? next3 : source[i]!;
+					i += quote.length;
+					scanFStringLiteralSegment(quote, isRaw);
+				} else {
+					consumePlainPythonString(startLine, isRaw);
+				}
 				continue;
 			}
 			tokens.push({ kind: "ident", value: ident, line: startLine });
@@ -807,9 +2223,9 @@ function tokenizePython(source: string): PyToken[] {
 			ch === ";" ||
 			ch === ":" ||
 			ch === "=" ||
-			ch === "*"
+			ch === "*" ||
+			ch === "+"
 		) {
-			// Distinguish `==` from assignment/keyword `=`
 			if (ch === "=" && source[i + 1] === "=") {
 				tokens.push({ kind: "punct", value: "==", line });
 				i += 2;
@@ -832,7 +2248,6 @@ function readDottedPythonModule(
 	startIdx: number,
 ): { modulePath: string; nextIdx: number } {
 	let idx = startIdx;
-	// Skip leading relative import dots (`from ..pkg import foo`)
 	while (
 		idx < tokens.length &&
 		tokens[idx]?.kind === "punct" &&
@@ -857,10 +2272,10 @@ function readDottedPythonModule(
 	return { modulePath: parts.join("."), nextIdx: idx };
 }
 
-function analyzePythonCompileArgs(
+function splitPythonCallArguments(
 	tokens: readonly PyToken[],
 	openParenIdx: number,
-): { argCount: number; hasModeKwarg: boolean } {
+): { args: PyToken[][]; closeParenIdx: number } {
 	let depth = 1;
 	let idx = openParenIdx + 1;
 	const segments: PyToken[][] = [[]];
@@ -890,9 +2305,20 @@ function analyzePythonCompileArgs(
 		idx += 1;
 	}
 
-	const nonEmpty = segments.filter((seg) => seg.length > 0);
+	const closeParenIdx = depth === 0 ? idx : -1;
+	return {
+		args: segments.filter((seg) => seg.length > 0),
+		closeParenIdx,
+	};
+}
+
+function analyzePythonCompileArgs(
+	tokens: readonly PyToken[],
+	openParenIdx: number,
+): { argCount: number; hasModeKwarg: boolean } {
+	const { args } = splitPythonCallArguments(tokens, openParenIdx);
 	let hasModeKwarg = false;
-	for (const seg of nonEmpty) {
+	for (const seg of args) {
 		if (
 			seg[0]?.kind === "ident" &&
 			seg[0].value === "mode" &&
@@ -902,8 +2328,7 @@ function analyzePythonCompileArgs(
 			hasModeKwarg = true;
 		}
 	}
-
-	return { argCount: nonEmpty.length, hasModeKwarg };
+	return { argCount: args.length, hasModeKwarg };
 }
 
 export function scanPythonScriptContent(
@@ -944,7 +2369,6 @@ export function scanPythonScriptContent(
 			findings.push(
 				makeLongLineFinding(relFile, logicalStartLine, logicalAccLength),
 			);
-			// Blank out the oversized continued block while preserving line count
 			for (let back = logicalStartLine - 1; back < sanitizedLines.length; back++) {
 				sanitizedLines[back] = "";
 			}
@@ -967,10 +2391,39 @@ export function scanPythonScriptContent(
 	}
 
 	const tokens = tokenizePython(sanitizedLines.join("\n"));
+	const moduleAliases = new Map<string, string>();
+	const parenContexts: Array<"def_params" | "call_args" | "group"> = [];
 
 	for (let idx = 0; idx < tokens.length; idx++) {
 		const tok = tokens[idx]!;
 		const prev = idx > 0 ? tokens[idx - 1] : undefined;
+
+		if (tok.kind === "punct") {
+			if (tok.value === "(") {
+				const prev2 = idx > 1 ? tokens[idx - 2] : undefined;
+				if (
+					prev?.kind === "ident" &&
+					prev2?.kind === "ident" &&
+					prev2.value === "def"
+				) {
+					parenContexts.push("def_params");
+				} else if (
+					prev?.kind === "ident" ||
+					(prev?.kind === "punct" &&
+						(prev.value === ")" || prev.value === "]"))
+				) {
+					parenContexts.push("call_args");
+				} else {
+					parenContexts.push("group");
+				}
+				continue;
+			}
+			if (tok.value === ")" && parenContexts.length > 0) {
+				parenContexts.pop();
+				continue;
+			}
+		}
+
 		const isStmtStart =
 			!prev ||
 			prev.kind === "newline" ||
@@ -987,6 +2440,7 @@ export function scanPythonScriptContent(
 				let scanIdx = nextIdx + 1;
 				let paren = 0;
 				let expectSymbol = true;
+				let lastSymbol = "";
 				while (scanIdx < tokens.length) {
 					const cur = tokens[scanIdx]!;
 					if (cur.kind === "newline" && paren === 0) break;
@@ -1003,16 +2457,27 @@ export function scanPythonScriptContent(
 					}
 					if (cur.kind === "punct" && cur.value === ",") {
 						expectSymbol = true;
+						lastSymbol = "";
 						scanIdx += 1;
 						continue;
 					}
 					if (cur.kind === "ident" && cur.value === "as") {
+						const aliasTok = tokens[scanIdx + 1];
+						if (
+							aliasTok?.kind === "ident" &&
+							lastSymbol &&
+							PYTHON_ALIASABLE_MODULES.has(lastSymbol) &&
+							!modulePath
+						) {
+							moduleAliases.set(aliasTok.value, lastSymbol);
+						}
 						expectSymbol = false;
 						scanIdx += 2;
 						continue;
 					}
 					if (expectSymbol && cur.kind === "ident") {
 						importedSymbols.push(cur.value);
+						lastSymbol = cur.value;
 						expectSymbol = false;
 					}
 					scanIdx += 1;
@@ -1058,11 +2523,19 @@ export function scanPythonScriptContent(
 							...violation,
 						});
 					}
+					const rootMod = modulePath.split(".")[0] ?? "";
 					scanIdx = nextIdx;
 					if (
 						tokens[scanIdx]?.kind === "ident" &&
 						tokens[scanIdx]?.value === "as"
 					) {
+						const aliasTok = tokens[scanIdx + 1];
+						if (
+							aliasTok?.kind === "ident" &&
+							PYTHON_ALIASABLE_MODULES.has(rootMod)
+						) {
+							moduleAliases.set(aliasTok.value, rootMod);
+						}
 						scanIdx += 2;
 					}
 					continue;
@@ -1073,10 +2546,55 @@ export function scanPythonScriptContent(
 			continue;
 		}
 
-		// 3. Attribute network calls `urllib.request` / `urllib.urlopen`
+		// Track local variable aliasing (`my_os = os`, `my_os = (os,)[0]`, `b = __builtins__`)
+		if (
+			isStmtStart &&
+			tok.kind === "ident" &&
+			tokens[idx + 1]?.kind === "punct" &&
+			tokens[idx + 1]?.value === "="
+		) {
+			let rhsScan = idx + 2;
+			let rhsDepth = 0;
+			while (rhsScan < tokens.length) {
+				const rt = tokens[rhsScan]!;
+				if (rt.kind === "newline" && rhsDepth === 0) break;
+				if (rt.kind === "punct") {
+					if (rt.value === ";" && rhsDepth === 0) break;
+					if (rt.value === "(" || rt.value === "[" || rt.value === "{") {
+						rhsDepth += 1;
+					} else if (
+						(rt.value === ")" || rt.value === "]" || rt.value === "}") &&
+						rhsDepth > 0
+					) {
+						rhsDepth -= 1;
+					}
+				}
+				if (rt.kind === "ident") {
+					const beforeRt = tokens[rhsScan - 1];
+					const afterRt = tokens[rhsScan + 1];
+					const isAttrChainOrCall =
+						(beforeRt?.kind === "punct" && beforeRt.value === ".") ||
+						(afterRt?.kind === "punct" &&
+							(afterRt.value === "." || afterRt.value === "("));
+					const resolvedRhs = moduleAliases.get(rt.value) ?? rt.value;
+					if (!isAttrChainOrCall && PYTHON_ALIASABLE_MODULES.has(resolvedRhs)) {
+						moduleAliases.set(tok.value, resolvedRhs);
+						break;
+					}
+				}
+				rhsScan += 1;
+			}
+		}
+
+		const resolvedIdent =
+			tok.kind === "ident"
+				? (moduleAliases.get(tok.value) ?? tok.value)
+				: "";
+
+		// 3. Attribute network calls `urllib.request` / `urllib.urlopen` (including aliases)
 		if (
 			tok.kind === "ident" &&
-			tok.value === "urllib" &&
+			resolvedIdent === "urllib" &&
 			tokens[idx + 1]?.kind === "punct" &&
 			tokens[idx + 1]?.value === "." &&
 			tokens[idx + 2]?.kind === "ident" &&
@@ -1099,7 +2617,7 @@ export function scanPythonScriptContent(
 			continue;
 		}
 
-		// 4. Dynamic execution builtins: `eval()`, `exec()`, `__import__()`
+		// 4. Dynamic execution builtins: `eval()`, `exec()`, `__import__()` (including `b.eval()` on aliased `builtins`)
 		if (
 			tok.kind === "ident" &&
 			(tok.value === "eval" ||
@@ -1109,8 +2627,15 @@ export function scanPythonScriptContent(
 			tokens[idx + 1]?.value === "("
 		) {
 			const isAttr = prev?.kind === "punct" && prev.value === ".";
+			const prev2 = idx > 1 ? tokens[idx - 2] : undefined;
+			const resolvedRecv =
+				isAttr && prev2?.kind === "ident"
+					? (moduleAliases.get(prev2.value) ?? prev2.value)
+					: "";
+			const isBuiltinsAttr =
+				resolvedRecv === "builtins" || resolvedRecv === "__builtins__";
 			const isDef = prev?.kind === "ident" && prev.value === "def";
-			if (!isAttr && !isDef) {
+			if ((!isAttr || isBuiltinsAttr) && !isDef) {
 				findings.push({
 					file: relFile,
 					line: tok.line,
@@ -1130,13 +2655,20 @@ export function scanPythonScriptContent(
 			tokens[idx + 1]?.value === "("
 		) {
 			const isAttr = prev?.kind === "punct" && prev.value === ".";
+			const prev2 = idx > 1 ? tokens[idx - 2] : undefined;
+			const resolvedRecv =
+				isAttr && prev2?.kind === "ident"
+					? (moduleAliases.get(prev2.value) ?? prev2.value)
+					: "";
+			const isBuiltinsAttr =
+				resolvedRecv === "builtins" || resolvedRecv === "__builtins__";
 			const isDef = prev?.kind === "ident" && prev.value === "def";
-			if (!isAttr && !isDef) {
+			if ((!isAttr || isBuiltinsAttr) && !isDef) {
 				const { argCount, hasModeKwarg } = analyzePythonCompileArgs(
 					tokens,
 					idx + 1,
 				);
-				if (argCount >= 3 || hasModeKwarg) {
+				if (argCount >= 3 || hasModeKwarg || isBuiltinsAttr) {
 					findings.push({
 						file: relFile,
 						line: tok.line,
@@ -1150,7 +2682,7 @@ export function scanPythonScriptContent(
 			continue;
 		}
 
-		// 6. `getattr(__builtins__, ...)` / `getattr(builtins, ...)`
+		// 6. Dynamic reflection: `getattr(...)`, `globals()`, `locals()`, `vars(...)`
 		if (
 			tok.kind === "ident" &&
 			tok.value === "getattr" &&
@@ -1158,29 +2690,160 @@ export function scanPythonScriptContent(
 			tokens[idx + 1]?.value === "("
 		) {
 			const isAttr = prev?.kind === "punct" && prev.value === ".";
+			const prev2 = idx > 1 ? tokens[idx - 2] : undefined;
+			const resolvedRecv =
+				isAttr && prev2?.kind === "ident"
+					? (moduleAliases.get(prev2.value) ?? prev2.value)
+					: "";
+			const isBuiltinsAttr =
+				resolvedRecv === "builtins" || resolvedRecv === "__builtins__";
 			const isDef = prev?.kind === "ident" && prev.value === "def";
-			const targetArg = tokens[idx + 2];
-			if (
-				!isAttr &&
-				!isDef &&
-				targetArg?.kind === "ident" &&
-				(targetArg.value === "__builtins__" || targetArg.value === "builtins")
-			) {
+			if ((!isAttr || isBuiltinsAttr) && !isDef) {
+				const { args } = splitPythonCallArguments(tokens, idx + 1);
+				let matchedBuiltinsTarget = "";
+				let matchedModuleTarget = "";
+				if (args[0]) {
+					for (const argTok of args[0]) {
+						if (argTok.kind !== "ident") continue;
+						const resolved = moduleAliases.get(argTok.value) ?? argTok.value;
+						if (resolved === "__builtins__" || resolved === "builtins") {
+							matchedBuiltinsTarget = resolved;
+							break;
+						}
+						if (
+							!matchedModuleTarget &&
+							(resolved === "os" ||
+								resolved === "posix" ||
+								resolved === "nt" ||
+								resolved === "sys" ||
+								resolved === "urllib")
+						) {
+							matchedModuleTarget = resolved;
+						}
+					}
+				}
+
+				if (matchedBuiltinsTarget) {
+					findings.push({
+						file: relFile,
+						line: tok.line,
+						rule: "forbidden-dynamic-exec",
+						symbol: `getattr(${matchedBuiltinsTarget})`,
+						message: `Forbidden dynamic builtins lookup 'getattr(${matchedBuiltinsTarget}, ...)' in Skill script.`,
+					});
+				} else if (matchedModuleTarget) {
+					const label =
+						matchedModuleTarget === "sys"
+							? "getattr(sys)"
+							: matchedModuleTarget === "urllib"
+								? "getattr(urllib)"
+								: "getattr(os)";
+					findings.push({
+						file: relFile,
+						line: tok.line,
+						rule: "forbidden-dynamic-exec",
+						symbol: label,
+						message: `Forbidden dynamic module reflection '${label}' in Skill script.`,
+					});
+				} else {
+					const secondArg = args[1];
+					const isSingleStaticStringAttr =
+						secondArg !== undefined &&
+						secondArg.length === 1 &&
+						secondArg[0]?.kind === "string";
+					const literalAttr = isSingleStaticStringAttr
+						? secondArg[0]!.value
+						: "";
+					if (
+						!isSingleStaticStringAttr ||
+						DANGEROUS_PYTHON_REFLECTION_ATTRS.has(literalAttr)
+					) {
+						findings.push({
+							file: relFile,
+							line: tok.line,
+							rule: "forbidden-dynamic-exec",
+							symbol: "getattr()",
+							message:
+								"Forbidden dynamic attribute reflection 'getattr()' targeting a non-literal or dangerous capability in Skill script.",
+						});
+					}
+				}
+			}
+			continue;
+		}
+
+		if (
+			tok.kind === "ident" &&
+			(tok.value === "globals" || tok.value === "locals") &&
+			tokens[idx + 1]?.kind === "punct" &&
+			tokens[idx + 1]?.value === "("
+		) {
+			const isAttr = prev?.kind === "punct" && prev.value === ".";
+			const isDef = prev?.kind === "ident" && prev.value === "def";
+			if (!isAttr && !isDef) {
 				findings.push({
 					file: relFile,
 					line: tok.line,
 					rule: "forbidden-dynamic-exec",
-					symbol: `getattr(${targetArg.value})`,
-					message: `Forbidden dynamic builtins lookup 'getattr(${targetArg.value}, ...)' in Skill script.`,
+					symbol: `${tok.value}()`,
+					message: `Forbidden namespace reflection '${tok.value}()' in Skill script.`,
 				});
 			}
 			continue;
 		}
 
-		// Direct `__builtins__[...]` or `__builtins__.<attr>` access
 		if (
 			tok.kind === "ident" &&
-			tok.value === "__builtins__" &&
+			tok.value === "vars" &&
+			tokens[idx + 1]?.kind === "punct" &&
+			tokens[idx + 1]?.value === "("
+		) {
+			const isAttr = prev?.kind === "punct" && prev.value === ".";
+			const isDef = prev?.kind === "ident" && prev.value === "def";
+			if (!isAttr && !isDef) {
+				const { args, closeParenIdx } = splitPythonCallArguments(
+					tokens,
+					idx + 1,
+				);
+				const afterCall =
+					closeParenIdx !== -1 ? tokens[closeParenIdx + 1] : undefined;
+				const hasDangerousVarTarget =
+					args[0] !== undefined &&
+					args[0].some(
+						(t) =>
+							t.kind === "ident" &&
+							PYTHON_ALIASABLE_MODULES.has(
+								moduleAliases.get(t.value) ?? t.value,
+							),
+					);
+				const isUnpackedArg =
+					args[0]?.[0]?.kind === "punct" && args[0][0].value === "*";
+				const isIndexed =
+					afterCall?.kind === "punct" &&
+					(afterCall.value === "[" || afterCall.value === ".");
+				if (
+					args.length === 0 ||
+					isIndexed ||
+					isUnpackedArg ||
+					hasDangerousVarTarget
+				) {
+					findings.push({
+						file: relFile,
+						line: tok.line,
+						rule: "forbidden-dynamic-exec",
+						symbol: "vars()",
+						message:
+							"Forbidden namespace dictionary reflection 'vars()' in Skill script.",
+					});
+				}
+			}
+			continue;
+		}
+
+		// Direct `__builtins__`, `__globals__`, `__subclasses__`, or `sys.modules[...]` access
+		if (
+			tok.kind === "ident" &&
+			resolvedIdent === "__builtins__" &&
 			tokens[idx + 1]?.kind === "punct" &&
 			(tokens[idx + 1]?.value === "[" || tokens[idx + 1]?.value === ".")
 		) {
@@ -1195,16 +2858,51 @@ export function scanPythonScriptContent(
 			continue;
 		}
 
-		// 7. Unsafe OS shell calls: `os.system()`, `os.popen()`, `os.spawn*()`, `os.exec*()`
 		if (
 			tok.kind === "ident" &&
-			tok.value === "os" &&
+			(tok.value === "__globals__" || tok.value === "__subclasses__")
+		) {
+			findings.push({
+				file: relFile,
+				line: tok.line,
+				rule: "forbidden-dynamic-exec",
+				symbol: tok.value,
+				message: `Forbidden Python internal introspection attribute '${tok.value}' in Skill script.`,
+			});
+			continue;
+		}
+
+		if (
+			tok.kind === "ident" &&
+			resolvedIdent === "sys" &&
 			tokens[idx + 1]?.kind === "punct" &&
 			tokens[idx + 1]?.value === "." &&
 			tokens[idx + 2]?.kind === "ident" &&
-			FORBIDDEN_PYTHON_OS_CALLS.has(tokens[idx + 2]!.value) &&
+			tokens[idx + 2]?.value === "modules" &&
 			tokens[idx + 3]?.kind === "punct" &&
-			tokens[idx + 3]?.value === "("
+			(tokens[idx + 3]?.value === "[" || tokens[idx + 3]?.value === ".")
+		) {
+			findings.push({
+				file: relFile,
+				line: tok.line,
+				rule: "forbidden-dynamic-exec",
+				symbol: "sys.modules",
+				message:
+					"Forbidden dynamic module registry lookup 'sys.modules' in Skill script.",
+			});
+			continue;
+		}
+
+		// 7. Unsafe OS shell calls: `os.system()`, `os.popen()`, `os.spawn*()`, `os.exec*()` (including aliases & `__import__('os').system()`)
+		if (
+			tok.kind === "ident" &&
+			(resolvedIdent === "os" ||
+				resolvedIdent === "posix" ||
+				resolvedIdent === "nt") &&
+			tokens[idx + 1]?.kind === "punct" &&
+			tokens[idx + 1]?.value === "." &&
+			tokens[idx + 2]?.kind === "ident" &&
+			FORBIDDEN_PYTHON_OS_CALLS.has(tokens[idx + 2]!.value)
 		) {
 			const fnName = tokens[idx + 2]!.value;
 			findings.push({
@@ -1212,28 +2910,78 @@ export function scanPythonScriptContent(
 				line: tok.line,
 				rule: "forbidden-shell-execution",
 				symbol: `os.${fnName}()`,
-				message: `Forbidden shell execution call 'os.${fnName}()' in Skill script.`,
+				message: `Forbidden shell execution reference 'os.${fnName}()' in Skill script.`,
 			});
 			continue;
 		}
 
-		// 8. `shell=True` keyword argument
+		// 8. `shell=...` keyword argument (`shell=True` or any non-`False`/`None` expression inside call arguments)
 		if (
 			tok.kind === "ident" &&
 			tok.value === "shell" &&
 			tokens[idx + 1]?.kind === "punct" &&
-			tokens[idx + 1]?.value === "=" &&
-			tokens[idx + 2]?.kind === "ident" &&
-			tokens[idx + 2]?.value === "True"
+			tokens[idx + 1]?.value === "="
 		) {
-			findings.push({
-				file: relFile,
-				line: tok.line,
-				rule: "forbidden-shell-execution",
-				symbol: "shell=True",
-				message:
-					"Forbidden 'shell=True' in subprocess invocation; pass argument arrays with shell=False.",
-			});
+			const rhsTok = tokens[idx + 2];
+			if (rhsTok?.kind === "ident" && rhsTok.value === "True") {
+				findings.push({
+					file: relFile,
+					line: tok.line,
+					rule: "forbidden-shell-execution",
+					symbol: "shell=True",
+					message:
+						"Forbidden 'shell=True' in process invocation; companion scripts must remain shell-free.",
+				});
+				continue;
+			}
+
+			const inCallArgs =
+				parenContexts.length > 0 &&
+				parenContexts[parenContexts.length - 1] === "call_args" &&
+				prev?.kind === "punct" &&
+				(prev.value === "(" || prev.value === ",");
+			if (inCallArgs) {
+				// Collect RHS tokens up to `,` or matching `)` at current call depth
+				const rhsTokens: PyToken[] = [];
+				let scan = idx + 2;
+				let innerDepth = 0;
+				while (scan < tokens.length) {
+					const t = tokens[scan]!;
+					if (
+						t.kind === "punct" &&
+						(t.value === "(" || t.value === "[" || t.value === "{")
+					) {
+						innerDepth += 1;
+						rhsTokens.push(t);
+					} else if (
+						t.kind === "punct" &&
+						(t.value === ")" || t.value === "]" || t.value === "}")
+					) {
+						if (innerDepth === 0) break;
+						innerDepth -= 1;
+						rhsTokens.push(t);
+					} else if (innerDepth === 0 && t.kind === "punct" && t.value === ",") {
+						break;
+					} else if (t.kind !== "newline") {
+						rhsTokens.push(t);
+					}
+					scan += 1;
+				}
+				const isSafeLiteralFalseOrNone =
+					rhsTokens.length === 1 &&
+					rhsTokens[0]?.kind === "ident" &&
+					(rhsTokens[0].value === "False" || rhsTokens[0].value === "None");
+				if (!isSafeLiteralFalseOrNone) {
+					findings.push({
+						file: relFile,
+						line: tok.line,
+						rule: "forbidden-shell-execution",
+						symbol: "shell=True",
+						message:
+							"Forbidden non-False 'shell=...' argument in process invocation; companion scripts must remain shell-free.",
+					});
+				}
+			}
 		}
 	}
 
@@ -1244,6 +2992,7 @@ interface JsToken {
 	readonly kind: "ident" | "string" | "punct";
 	readonly value: string;
 	readonly line: number;
+	readonly escaped?: boolean;
 }
 
 const JS_REGEX_PRECEDING_PUNCT = new Set([
@@ -1363,6 +3112,91 @@ function canStartJsRegexLiteral(prev: JsToken | undefined): boolean {
 	return false;
 }
 
+function decodeJsUnicodeEscape(
+	source: string,
+	slashIdx: number,
+): { decoded: string; nextIdx: number } | null {
+	const n = source.length;
+	if (source[slashIdx] !== "\\" || source[slashIdx + 1] !== "u") {
+		return null;
+	}
+	const uIdx = slashIdx + 2;
+	if (uIdx >= n) {
+		return null;
+	}
+	if (source[uIdx] === "{") {
+		let scan = uIdx + 1;
+		while (scan < n && isHexDigitCode(source.charCodeAt(scan))) {
+			scan += 1;
+		}
+		if (scan > uIdx + 1 && scan < n && source[scan] === "}") {
+			const hexStr = source.slice(uIdx + 1, scan);
+			if (hexStr.length <= 8) {
+				const cp = Number.parseInt(hexStr, 16);
+				if (!Number.isNaN(cp) && cp <= 0x10ffff) {
+					return { decoded: String.fromCodePoint(cp), nextIdx: scan + 1 };
+				}
+			}
+		}
+		return null;
+	}
+	if (uIdx + 4 <= n) {
+		let allHex = true;
+		for (let h = 0; h < 4; h++) {
+			if (!isHexDigitCode(source.charCodeAt(uIdx + h))) {
+				allHex = false;
+				break;
+			}
+		}
+		if (allHex) {
+			const cp = Number.parseInt(source.slice(uIdx, uIdx + 4), 16);
+			return { decoded: String.fromCharCode(cp), nextIdx: uIdx + 4 };
+		}
+	}
+	return null;
+}
+
+function decodeJsStringEscape(
+	source: string,
+	slashIdx: number,
+): { decoded: string; nextIdx: number; lineDelta: number } {
+	const n = source.length;
+	const k = slashIdx + 1;
+	if (k >= n) {
+		return { decoded: "\\", nextIdx: k, lineDelta: 0 };
+	}
+	const esc = source[k]!;
+	if (esc === "\n") {
+		return { decoded: "", nextIdx: k + 1, lineDelta: 1 };
+	}
+	if (esc === "\r") {
+		if (source[k + 1] === "\n") {
+			return { decoded: "", nextIdx: k + 2, lineDelta: 1 };
+		}
+		return { decoded: "", nextIdx: k + 1, lineDelta: 0 };
+	}
+	if (
+		esc === "x" &&
+		k + 2 < n &&
+		isHexDigitCode(source.charCodeAt(k + 1)) &&
+		isHexDigitCode(source.charCodeAt(k + 2))
+	) {
+		const cp = Number.parseInt(source.slice(k + 1, k + 3), 16);
+		return { decoded: String.fromCodePoint(cp), nextIdx: k + 3, lineDelta: 0 };
+	}
+	if (esc === "u") {
+		const uni = decodeJsUnicodeEscape(source, slashIdx);
+		if (uni) {
+			return { decoded: uni.decoded, nextIdx: uni.nextIdx, lineDelta: 0 };
+		}
+	}
+	if (esc === "n") return { decoded: "\n", nextIdx: k + 1, lineDelta: 0 };
+	if (esc === "r") return { decoded: "\r", nextIdx: k + 1, lineDelta: 0 };
+	if (esc === "t") return { decoded: "\t", nextIdx: k + 1, lineDelta: 0 };
+	if (esc === "0") return { decoded: "\0", nextIdx: k + 1, lineDelta: 0 };
+	return { decoded: esc, nextIdx: k + 1, lineDelta: 0 };
+}
+
 function tokenizeJsOrTs(source: string): JsToken[] {
 	const tokens: JsToken[] = [];
 	const n = source.length;
@@ -1377,14 +3211,10 @@ function tokenizeJsOrTs(source: string): JsToken[] {
 		while (i < n) {
 			const ch = source[i]!;
 			if (ch === "\\") {
-				i += 1;
-				if (i < n) {
-					if (source[i] === "\n") {
-						line += 1;
-					}
-					textVal += source[i]!;
-					i += 1;
-				}
+				const esc = decodeJsStringEscape(source, i);
+				textVal += esc.decoded;
+				line += esc.lineDelta;
+				i = esc.nextIdx;
 				continue;
 			}
 			if (ch === "`") {
@@ -1452,7 +3282,7 @@ function tokenizeJsOrTs(source: string): JsToken[] {
 			continue;
 		}
 
-		// Single or double quoted string
+		// Single or double quoted string (decoding `\xHH`, `\uHHHH`, `\u{H+}`)
 		if (ch === "'" || ch === '"') {
 			const quote = ch;
 			const startLine = line;
@@ -1460,14 +3290,10 @@ function tokenizeJsOrTs(source: string): JsToken[] {
 			i += 1;
 			while (i < n && source[i] !== quote && source[i] !== "\n") {
 				if (source[i] === "\\") {
-					i += 1;
-					if (i < n) {
-						if (source[i] === "\n") {
-							line += 1;
-						}
-						val += source[i]!;
-						i += 1;
-					}
+					const esc = decodeJsStringEscape(source, i);
+					val += esc.decoded;
+					line += esc.lineDelta;
+					i = esc.nextIdx;
 					continue;
 				}
 				val += source[i]!;
@@ -1540,19 +3366,51 @@ function tokenizeJsOrTs(source: string): JsToken[] {
 			}
 		}
 
-		// Identifier or keyword
-		if (isJsIdentStart(ch)) {
-			const start = i;
+		// Identifier or keyword (supporting `\uHHHH` and `\u{H+}` Unicode escapes)
+		if (isJsIdentStart(ch) || (ch === "\\" && source[i + 1] === "u")) {
 			const startLine = line;
-			while (i < n && isJsIdentPart(source[i]!)) {
+			let identVal = "";
+			let hadEscape = false;
+			let validIdent = true;
+
+			if (ch === "\\") {
+				const uni = decodeJsUnicodeEscape(source, i);
+				if (uni) {
+					identVal += uni.decoded;
+					i = uni.nextIdx;
+					hadEscape = true;
+				} else {
+					validIdent = false;
+				}
+			} else {
+				identVal += ch;
 				i += 1;
 			}
-			tokens.push({
-				kind: "ident",
-				value: source.slice(start, i),
-				line: startLine,
-			});
-			continue;
+
+			if (validIdent) {
+				while (i < n) {
+					const partCh = source[i]!;
+					if (isJsIdentPart(partCh)) {
+						identVal += partCh;
+						i += 1;
+					} else if (partCh === "\\" && source[i + 1] === "u") {
+						const uni = decodeJsUnicodeEscape(source, i);
+						if (!uni) break;
+						identVal += uni.decoded;
+						i = uni.nextIdx;
+						hadEscape = true;
+					} else {
+						break;
+					}
+				}
+				tokens.push({
+					kind: "ident",
+					value: identVal,
+					line: startLine,
+					escaped: hadEscape,
+				});
+				continue;
+			}
 		}
 
 		// Numeric literal
@@ -1606,6 +3464,22 @@ function classifyJsModuleSpecifier(
 ): { rule: SkillSecurityRuleId; symbol: string; message: string } | null {
 	const trimmed = rawSpec.trim();
 	if (!trimmed) return null;
+	const lower = trimmed.toLowerCase();
+	if (lower.startsWith("data:")) {
+		return {
+			rule: "forbidden-dynamic-exec",
+			symbol: "data:",
+			message: `Forbidden 'data:' module specifier '${trimmed.slice(0, 32)}' in Skill script.`,
+		};
+	}
+	if (lower.startsWith("http://") || lower.startsWith("https://")) {
+		return {
+			rule: "forbidden-network-import",
+			symbol: lower.startsWith("https://") ? "https://" : "http://",
+			message: `Forbidden remote URL module specifier '${trimmed.slice(0, 48)}' in Skill script.`,
+		};
+	}
+
 	const withoutNodePrefix = trimmed.startsWith("node:")
 		? trimmed.slice(5)
 		: trimmed;
@@ -1623,7 +3497,7 @@ function classifyJsModuleSpecifier(
 		return {
 			rule: "forbidden-dynamic-exec",
 			symbol: rootMod,
-			message: `Forbidden Node.js execution/worker module '${trimmed}' imported in Skill script.`,
+			message: `Forbidden Node.js execution/runtime module '${trimmed}' imported in Skill script.`,
 		};
 	}
 
@@ -1657,6 +3531,25 @@ function getCallOpenParenIndex(
 	return -1;
 }
 
+function getBracketOpenIndex(
+	tokens: readonly JsToken[],
+	identIdx: number,
+): number {
+	const next = tokens[identIdx + 1];
+	if (next?.kind === "punct" && next.value === "[") {
+		return identIdx + 1;
+	}
+	if (
+		next?.kind === "punct" &&
+		next.value === "?." &&
+		tokens[identIdx + 2]?.kind === "punct" &&
+		tokens[identIdx + 2]?.value === "["
+	) {
+		return identIdx + 2;
+	}
+	return -1;
+}
+
 function findMatchingCloseParen(
 	tokens: readonly JsToken[],
 	openParenIdx: number,
@@ -1667,6 +3560,44 @@ function findMatchingCloseParen(
 		if (tok.kind === "punct" && tok.value === "(") {
 			depth += 1;
 		} else if (tok.kind === "punct" && tok.value === ")") {
+			depth -= 1;
+			if (depth === 0) {
+				return i;
+			}
+		}
+	}
+	return -1;
+}
+
+function findMatchingCloseBracket(
+	tokens: readonly JsToken[],
+	openBracketIdx: number,
+): number {
+	let depth = 1;
+	for (let i = openBracketIdx + 1; i < tokens.length; i++) {
+		const tok = tokens[i]!;
+		if (tok.kind === "punct" && tok.value === "[") {
+			depth += 1;
+		} else if (tok.kind === "punct" && tok.value === "]") {
+			depth -= 1;
+			if (depth === 0) {
+				return i;
+			}
+		}
+	}
+	return -1;
+}
+
+function findMatchingCloseBrace(
+	tokens: readonly JsToken[],
+	startIdx: number,
+): number {
+	let depth = 1;
+	for (let i = startIdx; i < tokens.length; i++) {
+		const tok = tokens[i]!;
+		if (tok.kind === "punct" && tok.value === "{") {
+			depth += 1;
+		} else if (tok.kind === "punct" && tok.value === "}") {
 			depth -= 1;
 			if (depth === 0) {
 				return i;
@@ -1693,7 +3624,6 @@ function isJsMethodOrFunctionDeclaration(
 		return true;
 	}
 
-	// Check preceding modifiers (`async eval(...) {`, `public async eval(...) {`)
 	let prefixIdx = identIdx - 1;
 	while (
 		prefixIdx >= 0 &&
@@ -1763,6 +3693,7 @@ function isJsMethodOrFunctionDeclaration(
 function isGlobalOrBareMemberAccess(
 	tokens: readonly JsToken[],
 	identIdx: number,
+	jsAliases: ReadonlyMap<string, string>,
 ): boolean {
 	const prev = tokens[identIdx - 1];
 	if (!prev || prev.kind !== "punct") {
@@ -1772,9 +3703,11 @@ function isGlobalOrBareMemberAccess(
 		return true;
 	}
 	const receiver = tokens[identIdx - 2];
-	return (
-		receiver?.kind === "ident" && GLOBAL_JS_OBJECTS.has(receiver.value)
-	);
+	if (receiver?.kind !== "ident") {
+		return false;
+	}
+	const resolved = jsAliases.get(receiver.value) ?? receiver.value;
+	return GLOBAL_JS_OBJECTS.has(resolved);
 }
 
 export function scanJsOrTsScriptContent(
@@ -1796,10 +3729,76 @@ export function scanJsOrTsScriptContent(
 	}
 
 	const tokens = tokenizeJsOrTs(sanitizedLines.join("\n"));
+	const jsAliases = new Map<string, string>();
 
 	for (let idx = 0; idx < tokens.length; idx++) {
 		const tok = tokens[idx]!;
 		const prev = idx > 0 ? tokens[idx - 1] : undefined;
+
+		// Track simple aliases (`const p = process`, `const g = globalThis`, `const R = Reflect`)
+		if (
+			tok.kind === "ident" &&
+			tokens[idx + 1]?.kind === "punct" &&
+			tokens[idx + 1]?.value === "=" &&
+			tokens[idx + 2]?.kind === "ident"
+		) {
+			const rhsResolved =
+				jsAliases.get(tokens[idx + 2]!.value) ?? tokens[idx + 2]!.value;
+			if (
+				rhsResolved === "process" ||
+				rhsResolved === "Reflect" ||
+				rhsResolved === "module" ||
+				GLOBAL_JS_OBJECTS.has(rhsResolved)
+			) {
+				jsAliases.set(tok.value, rhsResolved);
+			}
+		}
+
+		// Track destructuring from `Reflect` or `process` (`const { apply, construct } = Reflect`)
+		if (tok.kind === "punct" && tok.value === "{") {
+			const closeBrace = findMatchingCloseBrace(tokens, idx + 1);
+			if (
+				closeBrace !== -1 &&
+				tokens[closeBrace + 1]?.kind === "punct" &&
+				tokens[closeBrace + 1]?.value === "=" &&
+				tokens[closeBrace + 2]?.kind === "ident"
+			) {
+				const rhsObj =
+					jsAliases.get(tokens[closeBrace + 2]!.value) ??
+					tokens[closeBrace + 2]!.value;
+				if (rhsObj === "Reflect" || rhsObj === "process") {
+					for (let k = idx + 1; k < closeBrace; k++) {
+						const propTok = tokens[k]!;
+						if (propTok.kind !== "ident") continue;
+						const prevProp = tokens[k - 1];
+						if (prevProp?.kind === "punct" && prevProp.value === ":") continue;
+						if (
+							rhsObj === "Reflect" &&
+							(propTok.value === "apply" || propTok.value === "construct")
+						) {
+							findings.push({
+								file: relFile,
+								line: propTok.line,
+								rule: "forbidden-dynamic-exec",
+								symbol: `Reflect.${propTok.value}()`,
+								message: `Forbidden 'Reflect.${propTok.value}' reflection destructuring in Skill script.`,
+							});
+						} else if (
+							rhsObj === "process" &&
+							FORBIDDEN_PROCESS_METHODS.has(propTok.value)
+						) {
+							findings.push({
+								file: relFile,
+								line: propTok.line,
+								rule: "forbidden-dynamic-exec",
+								symbol: `process.${propTok.value}()`,
+								message: `Forbidden 'process.${propTok.value}' destructuring in Skill script.`,
+							});
+						}
+					}
+				}
+			}
+		}
 
 		// 1. Static ESM `import "spec"` or `import/export ... from "spec"`
 		if (
@@ -1851,34 +3850,92 @@ export function scanJsOrTsScriptContent(
 			}
 		}
 
-		// 3. CommonJS `require("spec")` and `createRequire(...)`
+		// 3. CommonJS `require("spec")`, non-literal `require(x)`, aliased `const r = require`, and `createRequire(...)`
 		if (tok.kind === "ident" && tok.value === "require") {
-			const openParenIdx = getCallOpenParenIndex(tokens, idx);
+			if (isJsMethodOrFunctionDeclaration(tokens, idx)) {
+				continue;
+			}
+			// Ignore non-destructuring object literal key `{ require: true }`
 			if (
-				openParenIdx !== -1 &&
-				!isJsMethodOrFunctionDeclaration(tokens, idx)
+				prev?.kind === "punct" &&
+				(prev.value === "{" || prev.value === ",") &&
+				tokens[idx + 1]?.kind === "punct" &&
+				tokens[idx + 1]?.value === ":"
 			) {
-				const argTok = tokens[openParenIdx + 1];
-				if (argTok?.kind === "string") {
-					const violation = classifyJsModuleSpecifier(argTok.value);
-					if (violation) {
+				const closeBrace = findMatchingCloseBrace(tokens, idx + 1);
+				const isDestructuring =
+					closeBrace !== -1 &&
+					tokens[closeBrace + 1]?.kind === "punct" &&
+					tokens[closeBrace + 1]?.value === "=";
+				if (!isDestructuring) {
+					continue;
+				}
+			}
+
+			const isMember =
+				prev?.kind === "punct" && (prev.value === "." || prev.value === "?.");
+			const memberRecvTok = isMember ? tokens[idx - 2] : undefined;
+			const resolvedMemberRecv =
+				memberRecvTok?.kind === "ident"
+					? (jsAliases.get(memberRecvTok.value) ?? memberRecvTok.value)
+					: "";
+			const isNodeRequire =
+				!isMember ||
+				resolvedMemberRecv === "module" ||
+				GLOBAL_JS_OBJECTS.has(resolvedMemberRecv);
+
+			if (isNodeRequire) {
+				const openParenIdx = getCallOpenParenIndex(tokens, idx);
+				if (openParenIdx !== -1) {
+					const closeParenIdx = findMatchingCloseParen(tokens, openParenIdx);
+					const argTok = tokens[openParenIdx + 1];
+					const isSingleStaticString =
+						argTok?.kind === "string" &&
+						(closeParenIdx === openParenIdx + 2 ||
+							(tokens[openParenIdx + 2]?.kind === "punct" &&
+								tokens[openParenIdx + 2]?.value === "," &&
+								closeParenIdx === openParenIdx + 3));
+					if (!isSingleStaticString) {
 						findings.push({
 							file: relFile,
 							line: tok.line,
-							...violation,
+							rule: "forbidden-dynamic-exec",
+							symbol: "require()",
+							message:
+								"Forbidden non-literal dynamic 'require()' call in Skill script.",
 						});
+					} else {
+						const violation = classifyJsModuleSpecifier(argTok.value);
+						if (violation) {
+							findings.push({
+								file: relFile,
+								line: tok.line,
+								...violation,
+							});
+						}
 					}
+				} else if (
+					!(prev?.kind === "ident" && prev.value === "typeof") &&
+					!(
+						prev?.kind === "ident" &&
+						(prev.value === "import" || prev.value === "export")
+					)
+				) {
+					findings.push({
+						file: relFile,
+						line: tok.line,
+						rule: "forbidden-dynamic-exec",
+						symbol: "require",
+						message:
+							"Forbidden aliasing or indirect reference to 'require' in Skill script.",
+					});
 				}
 				continue;
 			}
 		}
 
 		if (tok.kind === "ident" && tok.value === "createRequire") {
-			const openParenIdx = getCallOpenParenIndex(tokens, idx);
-			if (
-				openParenIdx !== -1 &&
-				!isJsMethodOrFunctionDeclaration(tokens, idx)
-			) {
+			if (!isJsMethodOrFunctionDeclaration(tokens, idx)) {
 				findings.push({
 					file: relFile,
 					line: tok.line,
@@ -1896,7 +3953,7 @@ export function scanJsOrTsScriptContent(
 			const openParenIdx = getCallOpenParenIndex(tokens, idx);
 			if (
 				openParenIdx !== -1 &&
-				isGlobalOrBareMemberAccess(tokens, idx) &&
+				isGlobalOrBareMemberAccess(tokens, idx, jsAliases) &&
 				!isJsMethodOrFunctionDeclaration(tokens, idx)
 			) {
 				findings.push({
@@ -1914,10 +3971,13 @@ export function scanJsOrTsScriptContent(
 		// 5. `new WebSocket(...)` or `new globalThis.WebSocket(...)`
 		if (tok.kind === "ident" && tok.value === "new") {
 			const next1 = tokens[idx + 1];
+			const resolvedNext1 =
+				next1?.kind === "ident"
+					? (jsAliases.get(next1.value) ?? next1.value)
+					: "";
 			const isDirectWs = next1?.kind === "ident" && next1.value === "WebSocket";
 			const isGlobalWs =
-				next1?.kind === "ident" &&
-				GLOBAL_JS_OBJECTS.has(next1.value) &&
+				GLOBAL_JS_OBJECTS.has(resolvedNext1) &&
 				tokens[idx + 2]?.kind === "punct" &&
 				(tokens[idx + 2]?.value === "." || tokens[idx + 2]?.value === "?.") &&
 				tokens[idx + 3]?.kind === "ident" &&
@@ -1951,7 +4011,7 @@ export function scanJsOrTsScriptContent(
 				tokens[idx + 2]?.value === "(";
 			if (
 				(openParenIdx !== -1 || isIndirectEval) &&
-				isGlobalOrBareMemberAccess(tokens, idx) &&
+				isGlobalOrBareMemberAccess(tokens, idx, jsAliases) &&
 				!isJsMethodOrFunctionDeclaration(tokens, idx)
 			) {
 				findings.push({
@@ -1965,16 +4025,84 @@ export function scanJsOrTsScriptContent(
 			}
 		}
 
-		// 7. `process.binding(...)` and `process.dlopen(...)`
+		// 7. Function `constructor("...")` prototype-chain lookup (`.constructor(...)`, `(() => {}).constructor`, `.constructor.constructor`)
 		if (
 			tok.kind === "ident" &&
-			tok.value === "process" &&
+			tok.value === "constructor" &&
+			prev?.kind === "punct" &&
+			(prev.value === "." || prev.value === "?.")
+		) {
+			const prev2 = tokens[idx - 2];
+			const calledDirectly = getCallOpenParenIndex(tokens, idx) !== -1;
+			const chainedConstructor =
+				prev2?.kind === "ident" && prev2.value === "constructor";
+			const onGroupedFnOrGlobal =
+				(prev2?.kind === "punct" &&
+					(prev2.value === ")" || prev2.value === "}")) ||
+				(prev2?.kind === "ident" &&
+					(prev2.value === "Function" || GLOBAL_JS_OBJECTS.has(prev2.value)));
+			if (calledDirectly || chainedConstructor || onGroupedFnOrGlobal) {
+				findings.push({
+					file: relFile,
+					line: tok.line,
+					rule: "forbidden-dynamic-exec",
+					symbol: "constructor()",
+					message:
+						"Forbidden dynamic Function 'constructor' lookup in Skill script.",
+				});
+				continue;
+			}
+		}
+
+		// 8. `Reflect.apply(...)` and `Reflect.construct(...)`
+		const resolvedJsIdent =
+			tok.kind === "ident" ? (jsAliases.get(tok.value) ?? tok.value) : "";
+
+		if (
+			tok.kind === "ident" &&
+			resolvedJsIdent === "Reflect" &&
 			tokens[idx + 1]?.kind === "punct" &&
 			(tokens[idx + 1]?.value === "." || tokens[idx + 1]?.value === "?.") &&
 			tokens[idx + 2]?.kind === "ident" &&
-			(tokens[idx + 2]?.value === "binding" ||
-				tokens[idx + 2]?.value === "dlopen") &&
-			getCallOpenParenIndex(tokens, idx + 2) !== -1
+			(tokens[idx + 2]?.value === "apply" ||
+				tokens[idx + 2]?.value === "construct")
+		) {
+			const method = tokens[idx + 2]!.value;
+			findings.push({
+				file: relFile,
+				line: tok.line,
+				rule: "forbidden-dynamic-exec",
+				symbol: `Reflect.${method}()`,
+				message: `Forbidden dynamic invocation 'Reflect.${method}()' in Skill script.`,
+			});
+			continue;
+		}
+
+		// 9. `process.binding`, `process.dlopen`, `process.getBuiltinModule` (including `.getBuiltinModule` on any receiver)
+		if (
+			tok.kind === "ident" &&
+			tok.value === "getBuiltinModule" &&
+			prev?.kind === "punct" &&
+			(prev.value === "." || prev.value === "?.")
+		) {
+			findings.push({
+				file: relFile,
+				line: tok.line,
+				rule: "forbidden-dynamic-exec",
+				symbol: "process.getBuiltinModule()",
+				message:
+					"Forbidden Node.js builtin loader 'process.getBuiltinModule()' in Skill script.",
+			});
+			continue;
+		}
+
+		if (
+			tok.kind === "ident" &&
+			resolvedJsIdent === "process" &&
+			tokens[idx + 1]?.kind === "punct" &&
+			(tokens[idx + 1]?.value === "." || tokens[idx + 1]?.value === "?.") &&
+			tokens[idx + 2]?.kind === "ident" &&
+			FORBIDDEN_PROCESS_METHODS.has(tokens[idx + 2]!.value)
 		) {
 			const method = tokens[idx + 2]!.value;
 			findings.push({
@@ -1982,20 +4110,159 @@ export function scanJsOrTsScriptContent(
 				line: tok.line,
 				rule: "forbidden-dynamic-exec",
 				symbol: `process.${method}()`,
-				message: `Forbidden native Node.js bridge 'process.${method}()' in Skill script.`,
+				message: `Forbidden Node.js runtime bridge 'process.${method}()' in Skill script.`,
 			});
+			continue;
+		}
+
+		// 10. Computed bracket property indexing (`globalThis["eval"]`, `globalThis["fetch"]`, `process["dlopen"]`, `process["getBuiltinModule"]`, `x["constructor"]`)
+		if (
+			tok.kind === "punct" &&
+			tok.value === "[" &&
+			tokens[idx + 1]?.kind === "string" &&
+			tokens[idx + 1]?.value === "constructor" &&
+			tokens[idx + 2]?.kind === "punct" &&
+			tokens[idx + 2]?.value === "]"
+		) {
+			const prevBeforeBracket =
+				prev?.kind === "punct" && prev.value === "?."
+					? tokens[idx - 2]
+					: prev;
+			if (
+				prevBeforeBracket &&
+				(prevBeforeBracket.kind === "ident" ||
+					prevBeforeBracket.kind === "string" ||
+					(prevBeforeBracket.kind === "punct" &&
+						(prevBeforeBracket.value === ")" ||
+							prevBeforeBracket.value === "]" ||
+							prevBeforeBracket.value === "}")))
+			) {
+				findings.push({
+					file: relFile,
+					line: tok.line,
+					rule: "forbidden-dynamic-exec",
+					symbol: "constructor()",
+					message:
+						"Forbidden computed '[\"constructor\"]' property lookup in Skill script.",
+				});
+			}
+		}
+
+		if (tok.kind === "ident") {
+			const openBracketIdx = getBracketOpenIndex(tokens, idx);
+			if (openBracketIdx !== -1) {
+				const closeBracketIdx = findMatchingCloseBracket(tokens, openBracketIdx);
+				const isSingleStaticKey =
+					closeBracketIdx === openBracketIdx + 2 &&
+					tokens[openBracketIdx + 1]?.kind === "string";
+				const staticKey = isSingleStaticKey
+					? tokens[openBracketIdx + 1]!.value
+					: null;
+
+				if (GLOBAL_JS_OBJECTS.has(resolvedJsIdent)) {
+					if (staticKey === null) {
+						findings.push({
+							file: relFile,
+							line: tok.line,
+							rule: "forbidden-dynamic-exec",
+							symbol: `${resolvedJsIdent}[]`,
+							message: `Forbidden dynamic computed property access on '${resolvedJsIdent}' in Skill script.`,
+						});
+					} else if (staticKey === "eval" || staticKey === "Function") {
+						findings.push({
+							file: relFile,
+							line: tok.line,
+							rule: "forbidden-dynamic-exec",
+							symbol: `${staticKey}()`,
+							message: `Forbidden computed '${resolvedJsIdent}["${staticKey}"]' lookup in Skill script.`,
+						});
+					} else if (
+						staticKey === "fetch" ||
+						staticKey === "WebSocket" ||
+						staticKey === "XMLHttpRequest"
+					) {
+						findings.push({
+							file: relFile,
+							line: tok.line,
+							rule: "forbidden-network-import",
+							symbol: staticKey === "fetch" ? "fetch()" : staticKey,
+							message: `Forbidden computed network '${resolvedJsIdent}["${staticKey}"]' lookup in Skill script.`,
+						});
+					} else if (
+						staticKey === "require" ||
+						staticKey === "process" ||
+						staticKey === "Reflect" ||
+						staticKey === "import"
+					) {
+						findings.push({
+							file: relFile,
+							line: tok.line,
+							rule: "forbidden-dynamic-exec",
+							symbol:
+								staticKey === "process"
+									? "globalThis.process"
+									: staticKey,
+							message: `Forbidden computed '${resolvedJsIdent}["${staticKey}"]' lookup in Skill script.`,
+						});
+					}
+				} else if (resolvedJsIdent === "process") {
+					if (staticKey === null) {
+						findings.push({
+							file: relFile,
+							line: tok.line,
+							rule: "forbidden-dynamic-exec",
+							symbol: "process[]",
+							message:
+								"Forbidden dynamic computed property access on 'process' in Skill script.",
+						});
+					} else if (FORBIDDEN_PROCESS_METHODS.has(staticKey)) {
+						findings.push({
+							file: relFile,
+							line: tok.line,
+							rule: "forbidden-dynamic-exec",
+							symbol: `process.${staticKey}()`,
+							message: `Forbidden computed 'process["${staticKey}"]' lookup in Skill script.`,
+						});
+					}
+				} else if (resolvedJsIdent === "Reflect") {
+					if (
+						staticKey === null ||
+						staticKey === "apply" ||
+						staticKey === "construct"
+					) {
+						const sym =
+							staticKey === null ? "Reflect[]" : `Reflect.${staticKey}()`;
+						findings.push({
+							file: relFile,
+							line: tok.line,
+							rule: "forbidden-dynamic-exec",
+							symbol: sym,
+							message: `Forbidden computed '${sym}' lookup in Skill script.`,
+						});
+					}
+				}
+			}
 		}
 	}
 
 	return findings;
 }
 
-function stripShellInlineComment(line: string): string {
+function stripShellInlineCommentAndCheckContinuation(rawLine: string): {
+	uncommented: string;
+	continuesNext: boolean;
+} {
 	let inSingle = false;
 	let inDouble = false;
-	for (let i = 0; i < line.length; i++) {
-		const ch = line[i]!;
+	for (let i = 0; i < rawLine.length; i++) {
+		const ch = rawLine[i]!;
 		if (ch === "\\" && !inSingle) {
+			if (i + 1 === rawLine.length) {
+				return {
+					uncommented: rawLine.slice(0, i),
+					continuesNext: true,
+				};
+			}
 			i += 1;
 			continue;
 		}
@@ -2011,47 +4278,285 @@ function stripShellInlineComment(line: string): string {
 			ch === "#" &&
 			!inSingle &&
 			!inDouble &&
-			(i === 0 || line[i - 1] === " " || line[i - 1] === "\t")
+			(i === 0 || rawLine[i - 1] === " " || rawLine[i - 1] === "\t")
 		) {
-			return line.slice(0, i);
+			return {
+				uncommented: rawLine.slice(0, i),
+				continuesNext: false,
+			};
 		}
 	}
-	return line;
+	return { uncommented: rawLine, continuesNext: false };
 }
 
-function splitWhitespaceTokens(segment: string): string[] {
-	const out: string[] = [];
-	let start = -1;
-	for (let i = 0; i < segment.length; i++) {
-		const ch = segment[i]!;
-		const isWs = ch === " " || ch === "\t" || ch === "\r";
-		if (!isWs && start === -1) {
-			start = i;
-		} else if (isWs && start !== -1) {
-			out.push(segment.slice(start, i));
-			start = -1;
-		}
-	}
-	if (start !== -1) {
-		out.push(segment.slice(start));
-	}
-	return out;
+interface ParsedShellCommand {
+	readonly words: string[];
+	readonly pipelineId: number;
+	readonly pipedToNext: boolean;
 }
 
-function extractLeadingShellCommand(segment: string): string {
-	const tokens = splitWhitespaceTokens(segment);
-	for (const tok of tokens) {
-		if (tok === "sudo" || tok === "env") {
+interface ShellLexerFrame {
+	readonly kind: "top" | "$(" | "`" | "<(" | "(";
+	readonly resumeQuote: "unquoted" | "double";
+	words: string[];
+	currentWord: string;
+	wordTouched: boolean;
+	pipelineId: number;
+}
+
+/**
+ * Single-pass linear O(n) shell command & substitution parser.
+ * Extracts simple commands across pipelines (`|`), chains (`&&`, `||`, `;`, `&`),
+ * command substitutions (`$(...)` and backticks, including inside double quotes),
+ * process substitutions (`<(...)`, `>(...)`), and subshells (`(...)`).
+ */
+function parseShellLogicalLineCommands(line: string): ParsedShellCommand[] {
+	const commands: ParsedShellCommand[] = [];
+	let nextPipelineId = 1;
+
+	let frame: ShellLexerFrame = {
+		kind: "top",
+		resumeQuote: "unquoted",
+		words: [],
+		currentWord: "",
+		wordTouched: false,
+		pipelineId: nextPipelineId++,
+	};
+	let quoteMode: "unquoted" | "single" | "double" = "unquoted";
+	const stack: ShellLexerFrame[] = [];
+
+	const flushWord = (f: ShellLexerFrame): void => {
+		if (f.wordTouched) {
+			f.words.push(f.currentWord);
+			f.currentWord = "";
+			f.wordTouched = false;
+		}
+	};
+
+	const emitCommand = (f: ShellLexerFrame, pipedToNext: boolean): void => {
+		flushWord(f);
+		if (f.words.length > 0) {
+			commands.push({
+				words: f.words,
+				pipelineId: f.pipelineId,
+				pipedToNext,
+			});
+			f.words = [];
+		}
+		if (!pipedToNext) {
+			f.pipelineId = nextPipelineId++;
+		}
+	};
+
+	const pushSubshellFrame = (
+		kind: "$(" | "`" | "<(" | "(",
+		resumeQuote: "unquoted" | "double",
+	): void => {
+		stack.push(frame);
+		frame = {
+			kind,
+			resumeQuote,
+			words: [],
+			currentWord: "",
+			wordTouched: false,
+			pipelineId: nextPipelineId++,
+		};
+		quoteMode = "unquoted";
+	};
+
+	const popSubshellFrame = (): void => {
+		emitCommand(frame, false);
+		const parent = stack.pop();
+		if (parent) {
+			quoteMode = parent.resumeQuote;
+			frame = parent;
+		} else {
+			quoteMode = "unquoted";
+		}
+	};
+
+	for (let i = 0; i < line.length; i++) {
+		const ch = line[i]!;
+
+		if (quoteMode === "single") {
+			if (ch === "'") {
+				quoteMode = "unquoted";
+			} else {
+				frame.currentWord += ch;
+				frame.wordTouched = true;
+			}
 			continue;
 		}
-		// Skip inline KEY=VAL assignments after `env` or at start of command
-		if (tok.includes("=") && !tok.startsWith("-")) {
+
+		if (quoteMode === "double") {
+			if (ch === '"') {
+				quoteMode = "unquoted";
+				continue;
+			}
+			if (ch === "\\" && i + 1 < line.length) {
+				const nextCh = line[i + 1]!;
+				if (
+					nextCh === "$" ||
+					nextCh === "`" ||
+					nextCh === '"' ||
+					nextCh === "\\"
+				) {
+					frame.currentWord += nextCh;
+					frame.wordTouched = true;
+					i += 1;
+					continue;
+				}
+				frame.currentWord += ch;
+				frame.wordTouched = true;
+				continue;
+			}
+			if (ch === "$" && line[i + 1] === "(") {
+				frame.wordTouched = true;
+				pushSubshellFrame("$(", "double");
+				i += 1;
+				continue;
+			}
+			if (ch === "`") {
+				if (frame.kind === "`") {
+					popSubshellFrame();
+				} else {
+					frame.wordTouched = true;
+					pushSubshellFrame("`", "double");
+				}
+				continue;
+			}
+			frame.currentWord += ch;
+			frame.wordTouched = true;
 			continue;
 		}
-		if (tok.startsWith("-")) {
+
+		// Unquoted mode
+		if (ch === "#" && !frame.wordTouched) {
+			break;
+		}
+		if (ch === "'") {
+			quoteMode = "single";
+			frame.wordTouched = true;
 			continue;
 		}
-		return tok;
+		if (ch === '"') {
+			quoteMode = "double";
+			frame.wordTouched = true;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < line.length) {
+			frame.currentWord += line[i + 1]!;
+			frame.wordTouched = true;
+			i += 1;
+			continue;
+		}
+		if (ch === "$" && line[i + 1] === "(") {
+			frame.wordTouched = true;
+			pushSubshellFrame("$(", "unquoted");
+			i += 1;
+			continue;
+		}
+		if ((ch === "<" || ch === ">") && line[i + 1] === "(") {
+			flushWord(frame);
+			pushSubshellFrame("<(", "unquoted");
+			i += 1;
+			continue;
+		}
+		if (ch === "(") {
+			emitCommand(frame, false);
+			pushSubshellFrame("(", "unquoted");
+			continue;
+		}
+		if (ch === ")") {
+			if (stack.length > 0 && frame.kind !== "`") {
+				popSubshellFrame();
+			} else {
+				emitCommand(frame, false);
+			}
+			continue;
+		}
+		if (ch === "`") {
+			if (frame.kind === "`") {
+				popSubshellFrame();
+			} else {
+				frame.wordTouched = true;
+				pushSubshellFrame("`", "unquoted");
+			}
+			continue;
+		}
+		if (ch === " " || ch === "\t" || ch === "\r") {
+			flushWord(frame);
+			continue;
+		}
+		if (ch === "|") {
+			if (line[i + 1] === "|") {
+				emitCommand(frame, false);
+				i += 1;
+			} else {
+				emitCommand(frame, true);
+			}
+			continue;
+		}
+		if (ch === ";" || ch === "&") {
+			emitCommand(frame, false);
+			if (ch === "&" && line[i + 1] === "&") {
+				i += 1;
+			}
+			continue;
+		}
+		if (
+			(ch === "{" || ch === "}") &&
+			!frame.wordTouched &&
+			(i + 1 >= line.length ||
+				line[i + 1] === " " ||
+				line[i + 1] === "\t" ||
+				line[i + 1] === ";")
+		) {
+			emitCommand(frame, false);
+			continue;
+		}
+
+		frame.currentWord += ch;
+		frame.wordTouched = true;
+	}
+
+	while (stack.length > 0) {
+		popSubshellFrame();
+	}
+	emitCommand(frame, false);
+
+	return commands;
+}
+
+function extractLeadingCommandFromWords(words: readonly string[]): string {
+	let idx = 0;
+	while (idx < words.length) {
+		const w = words[idx]!;
+		if (w.includes("=") && !w.startsWith("-")) {
+			idx += 1;
+			continue;
+		}
+		const base = path.posix.basename(w.replace(/\\/g, "/")).toLowerCase();
+		if (SHELL_COMMAND_WRAPPERS.has(base)) {
+			idx += 1;
+			while (idx < words.length && words[idx]!.startsWith("-")) {
+				const flag = words[idx]!;
+				idx += 1;
+				if (
+					base === "sudo" &&
+					(flag === "-u" || flag === "-g") &&
+					idx < words.length
+				) {
+					idx += 1;
+				}
+			}
+			continue;
+		}
+		if (w.startsWith("-")) {
+			idx += 1;
+			continue;
+		}
+		return w;
 	}
 	return "";
 }
@@ -2062,6 +4567,12 @@ export function scanShellScriptContent(
 ): SkillSecurityFinding[] {
 	const findings: SkillSecurityFinding[] = [];
 	const lines = rawContent.split(/\r?\n/);
+	const logicalLines: Array<{ lineNo: number; text: string }> = [];
+
+	// 1. Enforce MAX_SCANNED_LINE_LENGTH and join `\`-continued lines
+	let accText = "";
+	let accStartLine = 1;
+	let inContinuation = false;
 
 	for (let idx = 0; idx < lines.length; idx++) {
 		const rawLine = lines[idx] ?? "";
@@ -2069,51 +4580,93 @@ export function scanShellScriptContent(
 
 		if (rawLine.length > MAX_SCANNED_LINE_LENGTH) {
 			findings.push(makeLongLineFinding(relFile, lineNo, rawLine.length));
+			accText = "";
+			inContinuation = false;
 			continue;
 		}
 
-		const uncommented = stripShellInlineComment(rawLine).trim();
-		if (!uncommented) {
+		// A comment line starting with `#` never continues onto the next line
+		if (!inContinuation && rawLine.trimStart().startsWith("#")) {
 			continue;
 		}
 
-		// Split pipeline segments (`|` but not `||`) in O(n) time
-		const pipeSegments: string[] = [];
-		let segStart = 0;
-		for (let i = 0; i < uncommented.length; i++) {
-			if (uncommented[i] === "|") {
-				if (uncommented[i + 1] === "|") {
-					i += 1;
-					continue;
-				}
-				pipeSegments.push(uncommented.slice(segStart, i));
-				segStart = i + 1;
-			}
+		const { uncommented, continuesNext } =
+			stripShellInlineCommentAndCheckContinuation(rawLine);
+
+		if (!inContinuation) {
+			accStartLine = lineNo;
+			accText = uncommented;
+		} else {
+			accText += ` ${uncommented}`;
 		}
-		pipeSegments.push(uncommented.slice(segStart));
 
-		for (let p = 0; p + 1 < pipeSegments.length; p++) {
-			const left = pipeSegments[p]!;
-			const right = pipeSegments[p + 1]!;
-			const leftTokens = splitWhitespaceTokens(left);
-			const rightCmd = extractLeadingShellCommand(right);
-			const rightCmdLower = rightCmd.toLowerCase();
+		if (accText.length > MAX_SCANNED_LINE_LENGTH) {
+			findings.push(makeLongLineFinding(relFile, accStartLine, accText.length));
+			accText = "";
+			inContinuation = continuesNext;
+			if (continuesNext) {
+				accStartLine = lineNo + 1;
+			}
+			continue;
+		}
 
-			// 1. Remote download piped directly into an interpreter (`curl ... | sh`)
-			const downloader = leftTokens.find((t) => t === "curl" || t === "wget");
-			if (downloader && SHELL_PIPE_INTERPRETERS.has(rightCmd)) {
-				findings.push({
-					file: relFile,
-					line: lineNo,
-					rule: "forbidden-network-import",
-					symbol: `${downloader} | ${rightCmd}`,
-					message: `Forbidden remote pipe execution '${downloader} | ${rightCmd}' in Skill shell script.`,
-				});
+		if (continuesNext) {
+			inContinuation = true;
+		} else {
+			if (accText.trim().length > 0) {
+				logicalLines.push({ lineNo: accStartLine, text: accText });
+			}
+			accText = "";
+			inContinuation = false;
+		}
+	}
+
+	if (inContinuation && accText.trim().length > 0) {
+		logicalLines.push({ lineNo: accStartLine, text: accText });
+	}
+
+	// 2. Scan joined logical lines for pipelines, substitutions, and forbidden commands
+	for (const { lineNo, text } of logicalLines) {
+		const seenLineSymbols = new Set<string>();
+		const pushFindingOnce = (
+			rule: SkillSecurityRuleId,
+			symbol: string,
+			message: string,
+		): void => {
+			const key = `${rule}:${symbol}`;
+			if (!seenLineSymbols.has(key)) {
+				seenLineSymbols.add(key);
+				findings.push({ file: relFile, line: lineNo, rule, symbol, message });
+			}
+		};
+
+		const commands = parseShellLogicalLineCommands(text);
+
+		// Pipeline checks (`curl | sh`, `Invoke-WebRequest | iex`, `base64 -d | sh`, including `/bin/sh` & `/usr/bin/env bash`)
+		for (let c = 0; c + 1 < commands.length; c++) {
+			const left = commands[c]!;
+			const right = commands[c + 1]!;
+			if (!left.pipedToNext || left.pipelineId !== right.pipelineId) {
+				continue;
+			}
+			const leftBases = left.words.map((w) =>
+				path.posix.basename(w.replace(/\\/g, "/")),
+			);
+			const rightLeadRaw = extractLeadingCommandFromWords(right.words);
+			const rightBase = path.posix.basename(rightLeadRaw.replace(/\\/g, "/"));
+			const rightLower = rightBase.toLowerCase();
+
+			const downloader = leftBases.find((w) => w === "curl" || w === "wget");
+			if (downloader && SHELL_PIPE_INTERPRETERS.has(rightLower)) {
+				pushFindingOnce(
+					"forbidden-network-import",
+					`${downloader} | ${rightBase}`,
+					`Forbidden remote pipe execution '${downloader} | ${rightBase}' in Skill shell script.`,
+				);
 			}
 
-			// 2. PowerShell download cradle (`Invoke-WebRequest / iwr ... | iex`)
-			const psDownloader = leftTokens.find((t) => {
-				const low = t.toLowerCase();
+			const psDownloader = leftBases.find((w) => {
+				const low = w.toLowerCase();
 				return (
 					low === "invoke-webrequest" ||
 					low === "invoke-restmethod" ||
@@ -2123,74 +4676,175 @@ export function scanShellScriptContent(
 			});
 			if (
 				psDownloader &&
-				(rightCmdLower === "iex" || rightCmdLower === "invoke-expression")
+				(rightLower === "iex" ||
+					rightLower === "invoke-expression" ||
+					rightLower === "pwsh" ||
+					rightLower === "powershell")
 			) {
-				findings.push({
-					file: relFile,
-					line: lineNo,
-					rule: "forbidden-network-import",
-					symbol: psDownloader,
-					message: `Forbidden remote PowerShell execution cradle '${psDownloader}' in Skill script.`,
-				});
+				pushFindingOnce(
+					"forbidden-network-import",
+					psDownloader,
+					`Forbidden remote PowerShell execution cradle '${psDownloader}' in Skill script.`,
+				);
 			}
 
-			// 3. Obfuscated base64 decode piped into shell or eval
-			const hasBase64 = leftTokens.includes("base64");
+			const hasBase64 = leftBases.includes("base64");
 			const hasDecodeFlag =
-				leftTokens.includes("-d") || leftTokens.includes("--decode");
-			if (hasBase64 && hasDecodeFlag && BASE64_PIPE_INTERPRETERS.has(rightCmd)) {
-				findings.push({
-					file: relFile,
-					line: lineNo,
-					rule: "forbidden-dynamic-exec",
-					symbol: "base64 -d | sh",
-					message:
-						"Forbidden obfuscated base64 pipe execution in Skill shell script.",
-				});
+				left.words.includes("-d") ||
+				left.words.includes("-D") ||
+				left.words.includes("--decode");
+			if (hasBase64 && hasDecodeFlag && BASE64_PIPE_INTERPRETERS.has(rightLower)) {
+				pushFindingOnce(
+					"forbidden-dynamic-exec",
+					"base64 -d | sh",
+					"Forbidden obfuscated base64 pipe execution in Skill shell script.",
+				);
 			}
 		}
 
-		// 4. Reverse shell primitives (`/dev/tcp/`, `/dev/udp/`, `nc ... -e/-c/-l`)
-		const devSockMatch = /\/dev\/(?:tcp|udp)\//.exec(uncommented);
+		// Reverse shell `/dev/tcp/` or `/dev/udp/`
+		const devSockMatch = DEV_SOCKET_REGEX.exec(text);
 		if (devSockMatch?.[0]) {
-			findings.push({
-				file: relFile,
-				line: lineNo,
-				rule: "forbidden-shell-execution",
-				symbol: devSockMatch[0],
-				message:
-					"Forbidden reverse-shell primitive detected in Skill shell script.",
-			});
-		} else {
-			// Check each command separated by `;` or pipeline for `nc`/`ncat`/`netcat` with `-e`/`-c`/`-l`
-			for (const pipeSeg of pipeSegments) {
-				for (const subCmd of pipeSeg.split(";")) {
-					const cmdTokens = splitWhitespaceTokens(subCmd);
-					const ncIdx = cmdTokens.findIndex(
-						(t) => t === "nc" || t === "ncat" || t === "netcat",
+			pushFindingOnce(
+				"forbidden-shell-execution",
+				devSockMatch[0],
+				"Forbidden reverse-shell primitive detected in Skill shell script.",
+			);
+		}
+
+		// Unconditional command checks across top-level commands, `$(...)`, backticks, and `<(...)`
+		for (const cmd of commands) {
+			const leadRaw = extractLeadingCommandFromWords(cmd.words);
+			if (!leadRaw) continue;
+			const leadBase = path.posix.basename(leadRaw.replace(/\\/g, "/"));
+			const leadLower = leadBase.toLowerCase();
+
+			if (
+				leadLower === "nc" ||
+				leadLower === "ncat" ||
+				leadLower === "netcat"
+			) {
+				const hasExecOrListenFlag = cmd.words.some(
+					(t) => t === "-e" || t === "-c" || t === "-l",
+				);
+				if (hasExecOrListenFlag) {
+					pushFindingOnce(
+						"forbidden-shell-execution",
+						leadBase,
+						"Forbidden reverse-shell primitive detected in Skill shell script.",
 					);
-					if (ncIdx !== -1) {
-						const hasExecOrListenFlag = cmdTokens
-							.slice(ncIdx + 1)
-							.some((t) => t === "-e" || t === "-c" || t === "-l");
-						if (hasExecOrListenFlag) {
-							findings.push({
-								file: relFile,
-								line: lineNo,
-								rule: "forbidden-shell-execution",
-								symbol: cmdTokens[ncIdx]!,
-								message:
-									"Forbidden reverse-shell primitive detected in Skill shell script.",
-							});
-							break;
-						}
-					}
+				} else {
+					pushFindingOnce(
+						"forbidden-network-import",
+						leadBase,
+						`Forbidden raw socket utility '${leadBase}' in Skill shell script (violates zero-network policy).`,
+					);
 				}
+				continue;
+			}
+
+			if (FORBIDDEN_SHELL_NETWORK_COMMANDS.has(leadLower)) {
+				pushFindingOnce(
+					"forbidden-network-import",
+					leadBase,
+					`Forbidden outbound network/transfer command '${leadBase}' in Skill shell script (violates zero-network policy).`,
+				);
+				continue;
+			}
+
+			if (
+				leadLower === "eval" ||
+				leadLower === "iex" ||
+				leadLower === "invoke-expression"
+			) {
+				pushFindingOnce(
+					"forbidden-dynamic-exec",
+					leadBase,
+					`Forbidden dynamic command evaluation '${leadBase}' in Skill shell script.`,
+				);
+				continue;
+			}
+
+			if (FORBIDDEN_SHELL_SUBINTERPRETERS.has(leadLower)) {
+				pushFindingOnce(
+					"forbidden-shell-execution",
+					leadRaw,
+					`Forbidden nested shell interpreter invocation '${leadRaw}' in Skill shell script.`,
+				);
 			}
 		}
 	}
 
 	return findings;
+}
+
+function extractShebangLine(rawContent: string): string | null {
+	const normalized = rawContent.startsWith("\uFEFF")
+		? rawContent.slice(1)
+		: rawContent;
+	if (!normalized.startsWith("#!")) {
+		return null;
+	}
+	const nl = normalized.indexOf("\n");
+	const firstLine = (nl === -1 ? normalized : normalized.slice(0, nl)).trim();
+	return firstLine.slice(0, 256);
+}
+
+function scanScriptByExtensionOrShebang(
+	relFile: string,
+	ext: string,
+	shebangLine: string | null,
+	rawContent: string,
+): SkillSecurityFinding[] {
+	if (PYTHON_SCRIPT_EXTENSIONS.has(ext)) {
+		return scanPythonScriptContent(relFile, rawContent);
+	}
+	if (SHELL_SCRIPT_EXTENSIONS.has(ext)) {
+		return scanShellScriptContent(relFile, rawContent);
+	}
+	if (JS_TS_SCRIPT_EXTENSIONS.has(ext)) {
+		return scanJsOrTsScriptContent(relFile, rawContent);
+	}
+	if (FORBIDDEN_COMPANION_SCRIPT_EXTENSIONS.has(ext)) {
+		return [
+			{
+				file: relFile,
+				line: 1,
+				rule: "forbidden-shell-execution",
+				symbol: ext,
+				message: `Forbidden Windows/PowerShell companion script extension '${ext}' in '${relFile}'.`,
+			},
+			...scanShellScriptContent(relFile, rawContent),
+		];
+	}
+	if (shebangLine !== null) {
+		const lowerShebang = shebangLine.toLowerCase();
+		let payloadFindings: SkillSecurityFinding[];
+		if (lowerShebang.includes("python")) {
+			payloadFindings = scanPythonScriptContent(relFile, rawContent);
+		} else if (
+			lowerShebang.includes("node") ||
+			lowerShebang.includes("deno") ||
+			lowerShebang.includes("bun") ||
+			lowerShebang.includes("ts-node") ||
+			lowerShebang.includes("tsx")
+		) {
+			payloadFindings = scanJsOrTsScriptContent(relFile, rawContent);
+		} else {
+			payloadFindings = scanShellScriptContent(relFile, rawContent);
+		}
+		return [
+			{
+				file: relFile,
+				line: 1,
+				rule: "forbidden-shell-execution",
+				symbol: "#!",
+				message: `Forbidden '#!' shebang executable header in non-standard companion file '${relFile}'.`,
+			},
+			...payloadFindings,
+		];
+	}
+	return [];
 }
 
 interface WalkedSecurityTree {
@@ -2258,30 +4912,39 @@ function walkSkillSecurityTree(
 			continue;
 		}
 
-		if (entryLstat.isFile()) {
-			if (IGNORED_SCAN_FILES.has(entry.name)) {
-				continue;
-			}
-
-			const forbiddenExt = hasForbiddenBinaryExtension(entry.name);
-			if (forbiddenExt) {
-				structuralFindings.push({
-					file: relFile,
-					line: 1,
-					rule: "forbidden-binary-file",
-					symbol: forbiddenExt,
-					message: `Forbidden binary or archive file '${relFile}' (${forbiddenExt}) inside Skill directory.`,
-				});
-				continue;
-			}
-
-			const ext = path.extname(entry.name).toLowerCase();
-			if (NON_TEXT_MEDIA_EXTENSIONS.has(ext)) {
-				continue;
-			}
-
-			candidateTextFiles.push(fullPath);
+		if (!entryLstat.isFile()) {
+			structuralFindings.push({
+				file: relFile,
+				line: 1,
+				rule: "forbidden-binary-file",
+				symbol: "non-regular-file",
+				message: `Forbidden non-regular file '${relFile}' inside Skill directory.`,
+			});
+			continue;
 		}
+
+		if (IGNORED_SCAN_FILES.has(entry.name)) {
+			continue;
+		}
+
+		const forbiddenExt = hasForbiddenBinaryExtension(entry.name);
+		if (forbiddenExt) {
+			structuralFindings.push({
+				file: relFile,
+				line: 1,
+				rule: "forbidden-binary-file",
+				symbol: forbiddenExt,
+				message: `Forbidden binary or archive file '${relFile}' (${forbiddenExt}) inside Skill directory.`,
+			});
+			continue;
+		}
+
+		const ext = path.extname(entry.name).toLowerCase();
+		if (NON_TEXT_MEDIA_EXTENSIONS.has(ext)) {
+			continue;
+		}
+
+		candidateTextFiles.push(fullPath);
 	}
 
 	return {
@@ -2306,7 +4969,8 @@ function decodeUtf8TextIfApplicable(
 
 /**
  * Audit a single Skill directory for forbidden network exfiltration, dynamic code execution,
- * unsafe shell primitives, Trojan-Source hidden Unicode, symbolic links, and forbidden binary files.
+ * unsafe shell primitives, prompt-injection Markdown directives, Trojan-Source hidden Unicode,
+ * symbolic links, and forbidden binary files.
  */
 export function auditSkillSecurity(
 	skillDir: string,
@@ -2327,15 +4991,36 @@ export function auditSkillSecurity(
 			.relative(resolvedSkillDir, fullPath)
 			.replace(/\\/g, "/");
 		const ext = path.extname(fullPath).toLowerCase();
-		const isExecutableScript = EXECUTABLE_SCRIPT_EXTENSIONS.has(ext);
-		if (isExecutableScript) {
-			scannedFiles.push(relFile);
-		}
+		const isKnownExecutableExt = EXECUTABLE_SCRIPT_EXTENSIONS.has(ext);
 
-		const rawBuffer = fs.readFileSync(fullPath);
+		const boundedRead = readBoundedRegularFile(
+			fullPath,
+			relFile,
+			"Skill directory",
+		);
+		if (!boundedRead.ok) {
+			if (isKnownExecutableExt) {
+				scannedFiles.push(relFile);
+			}
+			findings.push(boundedRead.finding);
+			continue;
+		}
+		const rawBuffer = boundedRead.buffer;
 		const rawContent = decodeUtf8TextIfApplicable(rawBuffer, ext);
 		if (rawContent === null) {
+			if (isKnownExecutableExt) {
+				scannedFiles.push(relFile);
+			}
 			continue;
+		}
+
+		const nonStandardShebang = isKnownExecutableExt
+			? null
+			: extractShebangLine(rawContent);
+		const isExecutableScript =
+			isKnownExecutableExt || nonStandardShebang !== null;
+		if (isExecutableScript) {
+			scannedFiles.push(relFile);
 		}
 
 		const fileSha256 =
@@ -2357,20 +5042,28 @@ export function auditSkillSecurity(
 			fileFindings.push(tf);
 		}
 
-		let scriptFindings: SkillSecurityFinding[] = [];
-		if (ext === ".py") {
-			scriptFindings = scanPythonScriptContent(relFile, rawContent);
-		} else if (ext === ".sh") {
-			scriptFindings = scanShellScriptContent(relFile, rawContent);
-		} else if (isExecutableScript) {
-			scriptFindings = scanJsOrTsScriptContent(relFile, rawContent);
+		if (shouldScanMarkdownPromptInjection(relFile)) {
+			for (const mf of scanMarkdownForPromptInjection(relFile, rawContent)) {
+				if (mf.rule === "suspicious-long-line" && longLineSeen.has(mf.line)) {
+					continue;
+				}
+				fileFindings.push(mf);
+			}
 		}
 
-		for (const sf of scriptFindings) {
-			if (sf.rule === "suspicious-long-line" && longLineSeen.has(sf.line)) {
-				continue;
+		if (isExecutableScript) {
+			const scriptFindings = scanScriptByExtensionOrShebang(
+				relFile,
+				ext,
+				nonStandardShebang,
+				rawContent,
+			);
+			for (const sf of scriptFindings) {
+				if (sf.rule === "suspicious-long-line" && longLineSeen.has(sf.line)) {
+					continue;
+				}
+				fileFindings.push(sf);
 			}
-			fileFindings.push(sf);
 		}
 
 		for (const item of fileFindings) {
@@ -2397,34 +5090,60 @@ export function auditSkillSecurity(
 	};
 }
 
-function scanTopLevelCatalogSymlinks(
+interface NonSkillCatalogAuditResult {
+	readonly findings: SkillSecurityFinding[];
+	readonly scannedFiles: string[];
+	readonly auditedFilePaths: Set<string>;
+}
+
+/**
+ * Audit all non-skill directories and sibling files under `catalogRoot` (such as
+ * `catalog/subagents/**` and track root folders) for symbolic links, forbidden binary
+ * extensions, unexpected executable scripts / `#!` shebangs, Trojan Unicode, and
+ * Markdown prompt-injection / image-beacon payloads.
+ */
+function auditNonSkillCatalogTree(
 	catalogRoot: string,
 	coveredSkillDirs: ReadonlySet<string>,
+	allowlistEntries: readonly SecurityAllowlistEntry[],
 	currentDir: string = catalogRoot,
-): SkillSecurityFinding[] {
+	auditedFilePaths: Set<string> = new Set(),
+): NonSkillCatalogAuditResult {
 	if (!fs.existsSync(currentDir)) {
-		return [];
+		return { findings: [], scannedFiles: [], auditedFilePaths };
 	}
+
 	const findings: SkillSecurityFinding[] = [];
+	const scannedFiles: string[] = [];
 	const rootStat = fs.lstatSync(currentDir);
+
 	if (rootStat.isSymbolicLink()) {
 		const rel =
 			path.relative(catalogRoot, currentDir).replace(/\\/g, "/") || ".";
-		return [
-			{
-				file: rel,
-				line: 1,
-				rule: "forbidden-symlink",
-				symbol: "symlink",
-				message: `Forbidden symbolic link '${rel}' in catalog directory.`,
-			},
-		];
-	}
-	if (!rootStat.isDirectory()) {
-		return [];
+		return {
+			findings: [
+				{
+					file: rel,
+					line: 1,
+					rule: "forbidden-symlink",
+					symbol: "symlink",
+					message: `Forbidden symbolic link '${rel}' in catalog directory.`,
+				},
+			],
+			scannedFiles,
+			auditedFilePaths,
+		};
 	}
 
-	for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+	if (!rootStat.isDirectory()) {
+		return { findings, scannedFiles, auditedFilePaths };
+	}
+
+	const entries = fs
+		.readdirSync(currentDir, { withFileTypes: true })
+		.sort((a, b) => a.name.localeCompare(b.name));
+
+	for (const entry of entries) {
 		const fullPath = path.join(currentDir, entry.name);
 		const resolvedFull = path.resolve(fullPath);
 		if (coveredSkillDirs.has(resolvedFull)) {
@@ -2432,6 +5151,7 @@ function scanTopLevelCatalogSymlinks(
 		}
 		const rel = path.relative(catalogRoot, fullPath).replace(/\\/g, "/");
 		const entryLstat = fs.lstatSync(fullPath);
+
 		if (entry.isSymbolicLink() || entryLstat.isSymbolicLink()) {
 			findings.push({
 				file: rel,
@@ -2442,17 +5162,186 @@ function scanTopLevelCatalogSymlinks(
 			});
 			continue;
 		}
-		if (entryLstat.isDirectory() && !IGNORED_SCAN_DIRS.has(entry.name)) {
-			findings.push(
-				...scanTopLevelCatalogSymlinks(catalogRoot, coveredSkillDirs, fullPath),
+
+		if (entryLstat.isDirectory()) {
+			if (IGNORED_SCAN_DIRS.has(entry.name)) {
+				continue;
+			}
+			const child = auditNonSkillCatalogTree(
+				catalogRoot,
+				coveredSkillDirs,
+				allowlistEntries,
+				fullPath,
+				auditedFilePaths,
 			);
+			findings.push(...child.findings);
+			scannedFiles.push(...child.scannedFiles);
+			continue;
+		}
+
+		if (!entryLstat.isFile()) {
+			findings.push({
+				file: rel,
+				line: 1,
+				rule: "forbidden-binary-file",
+				symbol: "non-regular-file",
+				message: `Forbidden non-regular file '${rel}' in catalog directory.`,
+			});
+			continue;
+		}
+
+		if (IGNORED_SCAN_FILES.has(entry.name)) {
+			continue;
+		}
+
+		auditedFilePaths.add(resolvedFull);
+
+		const forbiddenExt = hasForbiddenBinaryExtension(entry.name);
+		if (forbiddenExt) {
+			findings.push({
+				file: rel,
+				line: 1,
+				rule: "forbidden-binary-file",
+				symbol: forbiddenExt,
+				message: `Forbidden binary or archive file '${rel}' (${forbiddenExt}) in catalog directory.`,
+			});
+			continue;
+		}
+
+		const ext = path.extname(entry.name).toLowerCase();
+		if (NON_TEXT_MEDIA_EXTENSIONS.has(ext)) {
+			continue;
+		}
+
+		const isKnownScriptExt = EXECUTABLE_SCRIPT_EXTENSIONS.has(ext);
+		const boundedRead = readBoundedRegularFile(
+			fullPath,
+			rel,
+			"catalog directory",
+		);
+		if (!boundedRead.ok) {
+			if (isKnownScriptExt) {
+				scannedFiles.push(rel);
+				if (!FORBIDDEN_COMPANION_SCRIPT_EXTENSIONS.has(ext)) {
+					findings.push({
+						file: rel,
+						line: 1,
+						rule: "forbidden-shell-execution",
+						symbol: ext,
+						message: `Forbidden unexpected executable script '${rel}' outside a Skill directory.`,
+					});
+				}
+			}
+			findings.push(boundedRead.finding);
+			continue;
+		}
+		const rawBuffer = boundedRead.buffer;
+		const rawContent = decodeUtf8TextIfApplicable(rawBuffer, ext);
+		if (rawContent === null) {
+			if (isKnownScriptExt) {
+				scannedFiles.push(rel);
+				findings.push({
+					file: rel,
+					line: 1,
+					rule: "forbidden-shell-execution",
+					symbol: ext,
+					message: `Forbidden unexpected executable script '${rel}' outside a Skill directory.`,
+				});
+			}
+			continue;
+		}
+
+		const shebangLine = isKnownScriptExt ? null : extractShebangLine(rawContent);
+		const isExecutable = isKnownScriptExt || shebangLine !== null;
+		if (isExecutable) {
+			scannedFiles.push(rel);
+		}
+
+		const fileSha256 =
+			allowlistEntries.length > 0
+				? crypto.createHash("sha256").update(rawBuffer).digest("hex")
+				: "";
+
+		const fileFindings: SkillSecurityFinding[] = [];
+		const longLineSeen = new Set<number>();
+
+		for (const tf of scanTextForTrojanUnicode(rel, rawContent, isExecutable)) {
+			if (tf.rule === "suspicious-long-line") {
+				longLineSeen.add(tf.line);
+			}
+			fileFindings.push(tf);
+		}
+
+		if (
+			shouldScanMarkdownPromptInjection(rel) ||
+			ext === ".md" ||
+			ext === ".mdc"
+		) {
+			for (const mf of scanMarkdownForPromptInjection(rel, rawContent)) {
+				if (mf.rule === "suspicious-long-line" && longLineSeen.has(mf.line)) {
+					continue;
+				}
+				fileFindings.push(mf);
+			}
+		}
+
+		if (isKnownScriptExt) {
+			if (!FORBIDDEN_COMPANION_SCRIPT_EXTENSIONS.has(ext)) {
+				fileFindings.push({
+					file: rel,
+					line: 1,
+					rule: "forbidden-shell-execution",
+					symbol: ext,
+					message: `Forbidden unexpected executable script '${rel}' outside a Skill directory.`,
+				});
+			}
+			for (const sf of scanScriptByExtensionOrShebang(
+				rel,
+				ext,
+				null,
+				rawContent,
+			)) {
+				if (sf.rule === "suspicious-long-line" && longLineSeen.has(sf.line)) {
+					continue;
+				}
+				fileFindings.push(sf);
+			}
+		} else if (shebangLine !== null) {
+			for (const sf of scanScriptByExtensionOrShebang(
+				rel,
+				ext,
+				shebangLine,
+				rawContent,
+			)) {
+				if (sf.rule === "suspicious-long-line" && longLineSeen.has(sf.line)) {
+					continue;
+				}
+				fileFindings.push(sf);
+			}
+		}
+
+		for (const item of fileFindings) {
+			if (
+				fileSha256 &&
+				isFindingCoveredByAllowlist(
+					allowlistEntries,
+					fullPath,
+					item.rule,
+					fileSha256,
+				)
+			) {
+				continue;
+			}
+			findings.push(item);
 		}
 	}
-	return findings;
+
+	return { findings, scannedFiles, auditedFilePaths };
 }
 
 /**
- * Audit every Skill directory and Subagent file under `catalogDir` for security violations.
+ * Audit every Skill directory, Subagent definition, and non-skill folder under `catalogDir`
+ * for security violations.
  */
 export function auditCatalogSecurity(
 	catalogDir: string,
@@ -2465,10 +5354,14 @@ export function auditCatalogSecurity(
 	);
 	const skillDirs = discoverSkillDirectories(resolvedCatalog);
 	const coveredSkillDirs = new Set(skillDirs.map((d) => path.resolve(d)));
-	const scannedFiles: string[] = [];
-	const findings: SkillSecurityFinding[] = [
-		...scanTopLevelCatalogSymlinks(resolvedCatalog, coveredSkillDirs),
-	];
+
+	const nonSkillResult = auditNonSkillCatalogTree(
+		resolvedCatalog,
+		coveredSkillDirs,
+		allowlistEntries,
+	);
+	const scannedFiles: string[] = [...nonSkillResult.scannedFiles];
+	const findings: SkillSecurityFinding[] = [...nonSkillResult.findings];
 
 	for (const skillDir of skillDirs) {
 		const report = auditSkillSecurity(skillDir, options);
@@ -2486,41 +5379,74 @@ export function auditCatalogSecurity(
 		}
 	}
 
+	// Ensure any discovered SUBAGENT.md not already audited above is still checked
 	const subagentFiles = discoverSubagentFiles(resolvedCatalog);
 	for (const saFullPath of subagentFiles) {
+		const resolvedSa = path.resolve(saFullPath);
+		if (nonSkillResult.auditedFilePaths.has(resolvedSa)) {
+			continue;
+		}
+		let insideCoveredSkill = false;
+		for (const covered of coveredSkillDirs) {
+			const relToSkill = path.relative(covered, resolvedSa);
+			if (
+				relToSkill !== "" &&
+				!relToSkill.startsWith("..") &&
+				!path.isAbsolute(relToSkill)
+			) {
+				insideCoveredSkill = true;
+				break;
+			}
+		}
+		if (insideCoveredSkill) {
+			continue;
+		}
+
 		const relFile = path
 			.relative(resolvedCatalog, saFullPath)
 			.replace(/\\/g, "/");
-		const lstat = fs.lstatSync(saFullPath);
-		if (lstat.isSymbolicLink()) {
-			findings.push({
-				file: relFile,
-				line: 1,
-				rule: "forbidden-symlink",
-				symbol: "symlink",
-				message: `Forbidden symbolic link '${relFile}' in Subagent definition.`,
-			});
+		const boundedRead = readBoundedRegularFile(
+			saFullPath,
+			relFile,
+			"Subagent definition",
+		);
+		if (!boundedRead.ok) {
+			findings.push(boundedRead.finding);
 			continue;
 		}
-		const rawBuffer = fs.readFileSync(saFullPath);
+		const rawBuffer = boundedRead.buffer;
 		const rawContent = rawBuffer.toString("utf-8");
 		const fileSha256 =
 			allowlistEntries.length > 0
 				? crypto.createHash("sha256").update(rawBuffer).digest("hex")
 				: "";
+		const longLineSeen = new Set<number>();
+		const saFindings: SkillSecurityFinding[] = [];
 		for (const tf of scanTextForTrojanUnicode(relFile, rawContent, false)) {
+			if (tf.rule === "suspicious-long-line") {
+				longLineSeen.add(tf.line);
+			}
+			saFindings.push(tf);
+		}
+		for (const mf of scanMarkdownForPromptInjection(relFile, rawContent)) {
+			if (mf.rule === "suspicious-long-line" && longLineSeen.has(mf.line)) {
+				continue;
+			}
+			saFindings.push(mf);
+		}
+		for (const item of saFindings) {
 			if (
 				fileSha256 &&
 				isFindingCoveredByAllowlist(
 					allowlistEntries,
 					saFullPath,
-					tf.rule,
+					item.rule,
 					fileSha256,
 				)
 			) {
 				continue;
 			}
-			findings.push(tf);
+			findings.push(item);
 		}
 	}
 
