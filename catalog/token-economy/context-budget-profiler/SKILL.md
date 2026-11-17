@@ -33,7 +33,7 @@ Invoke this skill whenever `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules
    ```bash
    python catalog/token-economy/context-budget-profiler/scripts/profile_context_budget.py --repo . --json
    ```
-   Inspect `metrics.total_startup_tokens`, `findings`, and `split_suggestions` in the JSON output.
+   Inspect `metrics.total_startup_tokens`, `findings`, and `data.split_suggestions` in the JSON output.
 
 2. **Apply the Three-Level Progressive Disclosure Architecture:**
    - **Level 0 — Always-On Root Instructions (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `alwaysApply: true` rules):**
@@ -44,7 +44,7 @@ Invoke this skill whenever `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules
      Move domain-specific playbooks into scoped skills (`.claude/skills/<slug>/SKILL.md`, `.agent/skills/<slug>/SKILL.md`, or glob-scoped `.cursor/rules/*.mdc` with `alwaysApply: false`), and extract bulky API tables, examples, or checklists into `references/<topic>.md` linked from `SKILL.md`.
 
 3. **Remediate Bloated Context Files (`bloated-context-file`):**
-   - For any file exceeding `500` lines or `2,500` words, inspect `split_suggestions[].candidate_sections` from the profiler output.
+   - For any file exceeding `500` lines or `2,500` words, inspect `data.split_suggestions[].candidate_sections` from the profiler output.
    - Extract heavy reference sections into dedicated `references/<section-slug>.md` files and replace inline blocks with concise 1-line links explaining *when* the agent should read each reference file.
    - Never duplicate identical governance paragraphs across `CLAUDE.md`, `AGENTS.md`, and `.github/copilot-instructions.md`; maintain a single canonical source or modular skills.
 

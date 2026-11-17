@@ -52,9 +52,11 @@ Invoke this skill whenever code reads credentials from configuration, a `.env` f
 | `aws-access-key-id`, `github-token`, `anthropic-api-key`, `openai-api-key`, `google-api-key`, `huggingface-token`, `slack-token` | error | Provider key with a known prefix. |
 | `private-key-block` | error | A PEM private key header is present in a file. |
 | `hardcoded-secret-assignment` | warning | A secret-like name is assigned a literal string. Confirm it is not a placeholder. |
+| `skipped-long-line` | warning | A line exceeding 4,096 characters was skipped to prevent ReDoS; inspect minified bundles manually. |
+| `skipped-oversized-file` | warning | A file exceeding 2 MiB was skipped before reading into memory. |
 
 ## Scanner Behavior and Limits
-- Skips `.git`, `node_modules`, virtualenvs, build output, files over 1 MB and non-UTF-8 files.
+- Skips `.git`, `node_modules`, virtualenvs, build output, symbolic links, files over 2 MiB (emitting `skipped-oversized-file`), lines over 4,096 chars (emitting `skipped-long-line`), and non-UTF-8 files.
 - Never reads the content of real `.env*` files. It only checks whether they are tracked or ignored. Files ending in `.example`, `.sample`, `.template` or `.dist` are scanned like source files.
 - Values containing words like `example`, `changeme`, `your_` or `xxx`, and template syntax such as `${VAR}`, are treated as placeholders.
 - It is a heuristic scanner. A clean result does not prove the repository is free of secrets, and it does not inspect git history.
