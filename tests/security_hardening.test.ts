@@ -229,6 +229,8 @@ describe("Lagune Track 1 Security Hardening", () => {
 			")",
 			"code_obj = compile('import os', '<string>', 'exec')",
 			"kw_code = compile('1+1', filename='<string>', mode='eval')",
+			"import subprocess",
+			"subprocess.run(['git', 'status'], check=True)",
 		].join("\n");
 
 		const findings = scanPythonScriptContent("scripts/evil.py", badPython);
@@ -240,13 +242,16 @@ describe("Lagune Track 1 Security Hardening", () => {
 		expect(symbols).toContain("__import__()");
 		expect(symbols).toContain("getattr(__builtins__)");
 		expect(symbols).toContain("getattr(builtins)");
+		expect(symbols).toContain("subprocess");
 		expect(
 			findings.filter((f) => f.symbol === "compile()").length,
 		).toBeGreaterThanOrEqual(2);
 
-		// Legitimate Python patterns must produce 0 findings
+		// Legitimate offline Python stdlib patterns must produce 0 findings
 		const safePython = [
-			"import subprocess",
+			"import ast",
+			"import json",
+			"from pathlib import Path",
 			"from re import compile",
 			"from urllib.parse import urlparse",
 			"from http.server import HTTPServer",
@@ -259,7 +264,7 @@ describe("Lagune Track 1 Security Hardening", () => {
 			"",
 			"class Evaluator:",
 			"    def eval(self, text: str) -> bool:",
-			"        subprocess.run(['git', 'status'], check=True)",
+			"        _ = (ast, json, Path, urlparse, HTTPServer)",
 			"        return bool(PATTERN.match(text))",
 		].join("\n");
 
@@ -364,11 +369,17 @@ describe("Lagune Track 1 Security Hardening", () => {
 			fs.rmSync(tmpSkill, { recursive: true, force: true });
 		}
 
-		// Direct shell adversarial input with repeated curl tokens and no pipe stays fast and clean
-		const adversarialShell = `curl ${"curl ".repeat(500)}http://localhost:8080/health`;
-		expect(scanShellScriptContent("scripts/check.sh", adversarialShell)).toEqual(
-			[],
+		// Direct shell adversarial input with repeated tokens stays linear O(n): offline commands pass, curl is blocked
+		const safeAdversarialShell = `printf '%s\\n' ${"token ".repeat(500)}ok`;
+		expect(
+			scanShellScriptContent("scripts/check.sh", safeAdversarialShell),
+		).toEqual([]);
+		const adversarialCurlShell = `curl ${"curl ".repeat(500)}http://localhost:8080/health`;
+		const curlFindings = scanShellScriptContent(
+			"scripts/check.sh",
+			adversarialCurlShell,
 		);
+		expect(curlFindings.map((f) => f.symbol)).toContain("curl");
 	});
 
 	it("skips symbolic links and external targets in discoverSkillDirectories and discoverSubagentFiles", () => {

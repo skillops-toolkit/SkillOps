@@ -274,6 +274,7 @@ describe("SkillOps Core Models & Subagent Contracts", () => {
 					'"""Docstring mentioning urllib.request and eval() should be ignored."""',
 					"# Comment mentioning import socket and os.system('ls') should be ignored",
 					"import urllib.request",
+					"import webbrowser",
 					"from socket import create_connection",
 					"import pickle",
 					"import os, subprocess",
@@ -300,8 +301,10 @@ describe("SkillOps Core Models & Subagent Contracts", () => {
 			expect(rules).toContain("forbidden-dynamic-exec");
 			expect(rules).toContain("forbidden-shell-execution");
 			expect(symbols).toContain("urllib.request");
+			expect(symbols).toContain("webbrowser");
 			expect(symbols).toContain("socket");
 			expect(symbols).toContain("pickle");
+			expect(symbols).toContain("subprocess");
 			expect(symbols).toContain("eval()");
 			expect(symbols).toContain("os.system()");
 			expect(symbols).toContain("shell=True");
@@ -310,7 +313,7 @@ describe("SkillOps Core Models & Subagent Contracts", () => {
 			fs.rmSync(tmpSkill, { recursive: true, force: true });
 		}
 
-		// 3. Legitimate large/famous Skill patterns (local HTTP preview server, urllib.parse, re.compile, JS class eval method, CC by-nc strings, local curl healthcheck) pass with 0 false positives
+		// 3. Legitimate offline Skill patterns (local HTTPServer class reference, urllib.parse, re.compile, JS class eval method, CC by-nc strings, offline shell check) pass with 0 false positives
 		const legitSkill = fs.mkdtempSync(
 			path.join(os.tmpdir(), "skillops-legit-famous-skill-"),
 		);
@@ -320,8 +323,9 @@ describe("SkillOps Core Models & Subagent Contracts", () => {
 			fs.writeFileSync(
 				path.join(scriptsDir, "eval_viewer.py"),
 				[
-					"import subprocess",
-					"import webbrowser",
+					"import ast",
+					"import json",
+					"from pathlib import Path",
 					"from http.server import HTTPServer, BaseHTTPRequestHandler",
 					"from urllib.parse import urlparse, urlencode",
 					"from re import compile",
@@ -329,8 +333,9 @@ describe("SkillOps Core Models & Subagent Contracts", () => {
 					"REGEX = compile(r'^[a-z]+$')",
 					"",
 					"class Runner:",
-					"    def eval(self, query: str) -> None:",
-					"        subprocess.run(['git', 'status'], check=True)",
+					"    def eval(self, query: str) -> bool:",
+					"        _ = (ast, json, Path, HTTPServer, BaseHTTPRequestHandler, urlparse, urlencode)",
+					"        return bool(REGEX.match(query))",
 					"",
 				].join("\n"),
 				"utf-8",
@@ -351,7 +356,7 @@ describe("SkillOps Core Models & Subagent Contracts", () => {
 			);
 			fs.writeFileSync(
 				path.join(scriptsDir, "healthcheck.sh"),
-				"#!/usr/bin/env bash\ncurl -s http://localhost:3000/health\n",
+				"#!/usr/bin/env bash\nset -euo pipefail\ntest -d scripts && printf '%s\\n' '{\"status\":\"ok\"}'\n",
 				"utf-8",
 			);
 
