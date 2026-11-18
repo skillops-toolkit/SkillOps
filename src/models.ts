@@ -1,22 +1,147 @@
 /**
- * Normative Zod v3 schemas and TypeScript domain contracts for the SkillOps NPX Engine.
+ * Normative Zod v4 schemas and TypeScript domain contracts for the SkillOps NPX Engine.
  *
  * Enforces INV-SKILL-01 through INV-SKILL-05 for both Hybrid Executable Skills (SKILL.md)
  * and Context-Isolated Subagents (SUBAGENT.md / *.agent.md), as well as Token Economy
  * telemetry and Multi-Runtime Transpilation lockfiles.
  */
 
-import fs from "node:fs";
 import YAML from "yaml";
 import { z } from "zod";
+import { detectInstalledHarnesses } from "./io/bounded-fs.js";
+
+export {
+	detectInstalledHarnesses,
+	loadSkillOpsConfig,
+	loadSkillOpsConfigFromDisk,
+	MAX_COMPANION_OR_LOCK_BYTES,
+	MAX_CONFIG_FILE_BYTES,
+	MAX_MANIFEST_FILE_BYTES,
+	parseSkillMdFile,
+	parseSubagentMdFile,
+	readBoundedUtf8File,
+} from "./io/bounded-fs.js";
 
 export const SKILLOPS_VERSION = "1.5.2";
+export const MAX_LOCKFILE_ARTIFACTS = 4096;
+
+const MAX_RAW_MANIFEST_BYTES = 256 * 1024;
+const MAX_RAW_CONFIG_BYTES = 64 * 1024;
+const MAX_INPUT_PATH_CHARS = 256 * 1024;
 
 const SKILL_NAME_REGEX = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const SEMVER_REGEX = /^\d+\.\d+\.\d+$/;
 const FRONTMATTER_REGEX = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 const WORD_REGEX = /\S+/g;
 const PUNCT_CODE_REGEX = /[{}[\]()<>:;,.=`~@#$%^&*|\\/]/g;
+
+const FORBIDDEN_PROTOTYPE_SEGMENTS = new Set<string>([
+	"__proto__",
+	"constructor",
+	"prototype",
+]);
+
+const WINDOWS_RESERVED_DEVICE_STEMS = new Set<string>([
+	"CON",
+	"PRN",
+	"AUX",
+	"NUL",
+	"CONIN$",
+	"CONOUT$",
+	"COM1",
+	"COM2",
+	"COM3",
+	"COM4",
+	"COM5",
+	"COM6",
+	"COM7",
+	"COM8",
+	"COM9",
+	"COM\u00B9",
+	"COM\u00B2",
+	"COM\u00B3",
+	"LPT1",
+	"LPT2",
+	"LPT3",
+	"LPT4",
+	"LPT5",
+	"LPT6",
+	"LPT7",
+	"LPT8",
+	"LPT9",
+	"LPT\u00B9",
+	"LPT\u00B2",
+	"LPT\u00B3",
+]);
+
+function hasForbiddenOwnPrototypeKey(obj: object): boolean {
+	return (
+		Object.hasOwn(obj, "__proto__") ||
+		Object.hasOwn(obj, "constructor") ||
+		Object.hasOwn(obj, "prototype")
+	);
+}
+
+/**
+ * Validate a single path segment across POSIX and Windows filesystems in O(n) time.
+ * Rejects empty, '.', '..', prototype-polluting keys, segments ending in '.' or ' ',
+ * control characters, colons/separators/wildcards, and Windows reserved device stems
+ * (including superscript COM/LPT variants and device names followed by extensions like 'CON.md').
+ */
+export function isSafeCrossPlatformPathSegment(segment: string): boolean {
+	if (
+		typeof segment !== "string" ||
+		segment.length === 0 ||
+		segment.length > 255
+	) {
+		return false;
+	}
+	if (
+		segment === "." ||
+		segment === ".." ||
+		FORBIDDEN_PROTOTYPE_SEGMENTS.has(segment)
+	) {
+		return false;
+	}
+	if (segment.endsWith(".") || segment.endsWith(" ")) {
+		return false;
+	}
+
+	for (let i = 0; i < segment.length; i += 1) {
+		const code = segment.charCodeAt(i);
+		if (
+			code <= 0x1f ||
+			code === 0x7f ||
+			(code >= 0x80 && code <= 0x9f) ||
+			code === 0x2f || // '/'
+			code === 0x5c || // '\\'
+			code === 0x3a || // ':'
+			code === 0x3c || // '<'
+			code === 0x3e || // '>'
+			code === 0x22 || // '"'
+			code === 0x7c || // '|'
+			code === 0x3f || // '?'
+			code === 0x2a // '*'
+		) {
+			return false;
+		}
+	}
+
+	const dotIndex = segment.indexOf(".");
+	const rawStem = dotIndex === -1 ? segment : segment.slice(0, dotIndex);
+	let stemEnd = rawStem.length;
+	while (stemEnd > 0 && rawStem.charCodeAt(stemEnd - 1) === 0x20) {
+		stemEnd -= 1;
+	}
+	if (stemEnd > 0) {
+		const normalizedStem = rawStem.slice(0, stemEnd).toUpperCase();
+		if (WINDOWS_RESERVED_DEVICE_STEMS.has(normalizedStem)) {
+			return false;
+		}
+	}
+
+	return true;
+}
 
 /**
  * Deterministically strip trailing forward slashes in O(n) time without polynomial backtracking.
@@ -64,12 +189,17 @@ export function estimateTokenCount(text: string): number {
 }
 
 /**
- * Split a Markdown document into [frontmatterDict, markdownBody].
+ * Split a Markdown document into [frontmatterDict, markdownBody] with YAML alias amplification disabled.
  */
 export function splitFrontmatter(
 	rawText: string,
 	sourceLabel: string,
 ): [Record<string, unknown>, string] {
+	if (Buffer.byteLength(rawText, "utf-8") > MAX_RAW_MANIFEST_BYTES) {
+		throw new Error(
+			`Security violation: Document at '${sourceLabel}' exceeds maximum manifest size of ${MAX_RAW_MANIFEST_BYTES} bytes.`,
+		);
+	}
 	const match = FRONTMATTER_REGEX.exec(rawText);
 	if (!match) {
 		throw new Error(
@@ -78,10 +208,18 @@ export function splitFrontmatter(
 	}
 	const yamlText = match[1] ?? "";
 	const body = match[2] ?? "";
-	const parsed: unknown = YAML.parse(yamlText);
+	const parsed: unknown = YAML.parse(yamlText, {
+		maxAliasCount: 0,
+		uniqueKeys: true,
+	});
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error(
 			`YAML frontmatter in '${sourceLabel}' must evaluate to a key-value mapping.`,
+		);
+	}
+	if (hasForbiddenOwnPrototypeKey(parsed)) {
+		throw new Error(
+			`Security violation: YAML frontmatter in '${sourceLabel}' contains forbidden prototype keys.`,
 		);
 	}
 	return [parsed as Record<string, unknown>, body];
@@ -582,27 +720,6 @@ export const RUNTIME_HARNESS_SPECS: Readonly<
 };
 
 /**
- * Deterministically detect which of the 28 AI coding agent harnesses have configuration
- * directories or instruction files present in `repoPath`.
- */
-export function detectInstalledHarnesses(repoPath: string): RuntimeTarget[] {
-	const normalizedRoot = trimTrailingSlashes(repoPath.replace(/\\/g, "/"));
-	const detected: RuntimeTarget[] = [];
-
-	for (const target of ALL_RUNTIME_TARGETS) {
-		const spec = RUNTIME_HARNESS_SPECS[target];
-		const hasMatch = spec.detectionPaths.some((relPath) =>
-			fs.existsSync(`${normalizedRoot}/${relPath}`),
-		);
-		if (hasMatch) {
-			detected.push(target);
-		}
-	}
-
-	return detected;
-}
-
-/**
  * Resolve runtime target specifications (`"all"`, `"auto"`, `"core"`, or comma-separated target names)
  * into a deduplicated, validated list of `RuntimeTarget` values.
  */
@@ -659,15 +776,101 @@ export function resolveRuntimeTargets(
 }
 
 // ---------------------------------------------------------------------------
+// Cross-Platform Lockfile & Harness Boundary Validators
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate that a lockfile or repository-relative POSIX path cannot escape the repository,
+ * reference Windows reserved device stems, or pollute Object.prototype.
+ */
+export function isSafeLockRelativePath(value: string): boolean {
+	if (
+		typeof value !== "string" ||
+		value.length === 0 ||
+		value.length > 1024 ||
+		value.startsWith("/") ||
+		value.startsWith("\\") ||
+		value.endsWith("/") ||
+		value.includes("\0") ||
+		value.includes("\\") ||
+		value.includes(":")
+	) {
+		return false;
+	}
+	const segments = value.split("/");
+	if (segments.length === 0 || segments.length > 64) {
+		return false;
+	}
+	for (const segment of segments) {
+		if (!isSafeCrossPlatformPathSegment(segment)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Verify that `relPath` resides strictly beneath the declared harness's `skillsDir`,
+ * `subagentsDir`, `.github/prompts/` (when `target === "copilot"`), or equals `"AGENTS.md"`
+ * exclusively when `target === "codex"` (and `skillName` is omitted or `"codex-agents-index"`).
+ */
+export function isAllowedHarnessArtifactPath(
+	target: RuntimeTarget,
+	relPath: string,
+	skillName?: string,
+): boolean {
+	if (
+		typeof target !== "string" ||
+		!Object.hasOwn(RUNTIME_HARNESS_SPECS, target) ||
+		!isSafeLockRelativePath(relPath)
+	) {
+		return false;
+	}
+	if (
+		skillName !== undefined &&
+		(skillName.length === 0 ||
+			skillName.length > 128 ||
+			!isSafeCrossPlatformPathSegment(skillName))
+	) {
+		return false;
+	}
+
+	if (relPath === "AGENTS.md") {
+		return (
+			target === "codex" &&
+			(skillName === undefined || skillName === "codex-agents-index")
+		);
+	}
+
+	const spec = RUNTIME_HARNESS_SPECS[target];
+	if (spec.alwaysOnFiles.includes(relPath)) {
+		return false;
+	}
+
+	const inSkillsDir =
+		relPath.startsWith(`${spec.skillsDir}/`) &&
+		relPath.length > spec.skillsDir.length + 1;
+	const inSubagentsDir =
+		relPath.startsWith(`${spec.subagentsDir}/`) &&
+		relPath.length > spec.subagentsDir.length + 1;
+	const inCopilotPromptsDir =
+		target === "copilot" &&
+		relPath.startsWith(".github/prompts/") &&
+		relPath.length > ".github/prompts/".length;
+
+	return inSkillsDir || inSubagentsDir || inCopilotPromptsDir;
+}
+
+// ---------------------------------------------------------------------------
 // 1. Skill Manifest Contract (INV-SKILL-01 .. INV-SKILL-03)
 // ---------------------------------------------------------------------------
 
 export const RoutingSignalsSchema = z
 	.object({
-		languages: z.array(z.string()).default([]),
-		files_any: z.array(z.string()).default([]),
-		dependencies_any: z.array(z.string()).default([]),
-		negative_triggers: z.array(z.string()).default([]),
+		languages: z.array(z.string().max(256)).max(64).default([]),
+		files_any: z.array(z.string().max(256)).max(64).default([]),
+		dependencies_any: z.array(z.string().max(256)).max(64).default([]),
+		negative_triggers: z.array(z.string().max(512)).max(64).default([]),
 	})
 	.strict();
 export type RoutingSignals = z.infer<typeof RoutingSignalsSchema>;
@@ -675,10 +878,15 @@ export type RoutingSignals = z.infer<typeof RoutingSignalsSchema>;
 export const SkillDirectorySchema = z
 	.string()
 	.min(1)
+	.max(MAX_INPUT_PATH_CHARS)
 	.transform((val) => trimTrailingSlashes(val.replace(/\\/g, "/")))
-	.refine((val) => val.length > 0 && !val.includes("\0"), {
-		message: "Skill directory path must be a non-empty path without NUL bytes.",
-	});
+	.refine(
+		(val) => val.length > 0 && val.length <= 1024 && !val.includes("\0"),
+		{
+			message:
+				"Skill directory path must be a non-empty path (<= 1024 chars) without NUL bytes.",
+		},
+	);
 export type SkillDirectoryPath = z.infer<typeof SkillDirectorySchema>;
 
 export const ScriptEntrypointSchema = z
@@ -686,9 +894,12 @@ export const ScriptEntrypointSchema = z
 		path: z
 			.string()
 			.min(1)
+			.max(4096)
 			.transform((val) => trimSlashes(val.replace(/\\/g, "/")))
 			.refine(
 				(val) =>
+					val.length <= 512 &&
+					isSafeLockRelativePath(val) &&
 					val.startsWith("scripts/") &&
 					(val.endsWith(".py") ||
 						val.endsWith(".mjs") ||
@@ -696,34 +907,43 @@ export const ScriptEntrypointSchema = z
 						val.endsWith(".ts")),
 				{
 					message:
-						"Script entrypoint path must reside under 'scripts/' (.py, .mjs, .js, or .ts).",
+						"Script entrypoint path must be a safe relative path under 'scripts/' (.py, .mjs, .js, or .ts) without '..', colons, or reserved device names.",
 				},
 			),
-		description: z.string().min(10),
+		description: z.string().min(10).max(1024),
 	})
 	.strict();
 export type ScriptEntrypoint = z.infer<typeof ScriptEntrypointSchema>;
 
 export const SkillEntrypointsSchema = z
 	.object({
-		scripts: z.array(ScriptEntrypointSchema).min(1),
+		scripts: z.array(ScriptEntrypointSchema).min(1).max(32),
 	})
 	.strict();
 export type SkillEntrypoints = z.infer<typeof SkillEntrypointsSchema>;
 
 export const SkillManifestSchema = z
 	.object({
-		name: z.string().regex(SKILL_NAME_REGEX, {
-			message:
-				"Skill name must be lowercase kebab-case (e.g., 'mcp-architect').",
-		}),
+		name: z
+			.string()
+			.min(1)
+			.max(128)
+			.regex(SKILL_NAME_REGEX, {
+				message:
+					"Skill name must be lowercase kebab-case (e.g., 'mcp-architect').",
+			})
+			.refine(isSafeCrossPlatformPathSegment, {
+				message:
+					"Skill name cannot be a reserved cross-platform device stem (e.g., 'con', 'nul', 'aux', 'com1').",
+			}),
 		description: z
 			.string()
+			.max(4096)
 			.transform((val) => val.trim().replace(/\s+/g, " "))
 			.superRefine((cleaned, ctx) => {
 				if (!cleaned.startsWith("Use when")) {
 					ctx.addIssue({
-						code: z.ZodIssueCode.custom,
+						code: "custom",
 						message:
 							"Skill description must start with 'Use when' per SKILL_CONTRACT.md §4.2.",
 					});
@@ -731,21 +951,21 @@ export const SkillManifestSchema = z
 				const words = countWords(cleaned);
 				if (words < 40 || words > 110) {
 					ctx.addIssue({
-						code: z.ZodIssueCode.custom,
+						code: "custom",
 						message: `Skill description must contain between 40 and 110 words per INV-SKILL-01 (got ${words} words).`,
 					});
 				}
 				const tokens = estimateTokenCount(cleaned);
 				if (tokens > 160) {
 					ctx.addIssue({
-						code: z.ZodIssueCode.custom,
+						code: "custom",
 						message: `Skill description exceeds Level 1 budget of 160 tokens per INV-SKILL-01 (estimated ${tokens} tokens).`,
 					});
 				}
 			}),
-		version: z.string().regex(SEMVER_REGEX).default("1.0.0"),
+		version: z.string().max(32).regex(SEMVER_REGEX).default("1.0.0"),
 		track: CatalogTrackSchema,
-		tags: z.array(z.string().min(1)).min(1),
+		tags: z.array(z.string().min(1).max(64)).min(1).max(32),
 		routing_signals: RoutingSignalsSchema.default({
 			languages: [],
 			files_any: [],
@@ -773,11 +993,19 @@ export function createSkillManifest(input: unknown): SkillManifest {
 	};
 }
 
-export function parseSkillMdFile(filePath: string): SkillManifest {
-	const rawText = fs.readFileSync(filePath, "utf-8");
-	const normalizedPath = filePath.replace(/\\/g, "/");
+/**
+ * Pure text parser for `SKILL.md` documents (invoked by bounded filesystem readers).
+ */
+export function parseSkillMdText(
+	rawText: string,
+	sourceLabel: string = "SKILL.md",
+): {
+	manifest: SkillManifest;
+	markdownBody: string;
+	totalLines: number;
+} {
+	const normalizedPath = sourceLabel.replace(/\\/g, "/");
 	const totalLines = rawText.split(/\r?\n/).length;
-	// Drop trailing empty line from split if file ends with newline
 	const effectiveTotalLines = rawText.endsWith("\n")
 		? totalLines - 1
 		: totalLines;
@@ -793,11 +1021,16 @@ export function parseSkillMdFile(filePath: string): SkillManifest {
 			: body.split(/\r?\n/).length
 		: 0;
 	const bodyTokens = estimateTokenCount(body);
-	return createSkillManifest({
+	const manifest = createSkillManifest({
 		...frontmatter,
 		body_lines: bodyLines,
 		body_tokens: bodyTokens,
 	});
+	return {
+		manifest,
+		markdownBody: body,
+		totalLines: effectiveTotalLines,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -806,87 +1039,119 @@ export function parseSkillMdFile(filePath: string): SkillManifest {
 
 const FORBIDDEN_WILDCARD_TOOLS = new Set(["*", "all", "any", "**"]);
 
+export const SandboxModeSchema = z.enum(["read-only", "workspace-write"]);
+export type SandboxMode = z.infer<typeof SandboxModeSchema>;
+
 export const SubagentManifestSchema = z
 	.object({
-		name: z.string().regex(SKILL_NAME_REGEX, {
-			message:
-				"Subagent name must be lowercase kebab-case (e.g., 'context-scout').",
-		}),
+		name: z
+			.string()
+			.min(1)
+			.max(128)
+			.regex(SKILL_NAME_REGEX, {
+				message:
+					"Subagent name must be lowercase kebab-case (e.g., 'context-scout').",
+			})
+			.refine(isSafeCrossPlatformPathSegment, {
+				message:
+					"Subagent name cannot be a reserved cross-platform device stem (e.g., 'con', 'nul', 'aux', 'com1').",
+			}),
 		description: z
 			.string()
+			.max(4096)
 			.transform((val) => val.trim().replace(/\s+/g, " "))
 			.superRefine((cleaned, ctx) => {
 				const words = countWords(cleaned);
 				if (words < 10 || words > 110) {
 					ctx.addIssue({
-						code: z.ZodIssueCode.custom,
+						code: "custom",
 						message: `Subagent description must contain between 10 and 110 words (got ${words} words).`,
 					});
 				}
 				const tokens = estimateTokenCount(cleaned);
 				if (tokens > 160) {
 					ctx.addIssue({
-						code: z.ZodIssueCode.custom,
+						code: "custom",
 						message: `Subagent description exceeds Level 1 budget of 160 tokens (estimated ${tokens} tokens).`,
 					});
 				}
 			}),
 		tools: z
-			.array(z.string().min(1))
+			.array(z.string().min(1).max(64))
 			.min(1, {
 				message:
 					"Subagent must declare an explicit non-empty tool allowlist per INV-SKILL-04.",
 			})
+			.max(64)
 			.superRefine((tools, ctx) => {
 				for (const tool of tools) {
 					if (FORBIDDEN_WILDCARD_TOOLS.has(tool.trim().toLowerCase())) {
 						ctx.addIssue({
-							code: z.ZodIssueCode.custom,
+							code: "custom",
 							message: `Subagent tool allowlist cannot contain wildcard '${tool}' per INV-SKILL-04 least-privilege guarantee.`,
 						});
 					}
 				}
 			}),
+		disallowed_tools: z.array(z.string().min(1).max(64)).max(64).default([]),
+		sandbox_mode: SandboxModeSchema.default("read-only"),
 		user_invocable: z.boolean().default(true),
 		context_isolation: z.boolean().default(true),
 		max_output_tokens: z.number().int().min(50).max(400).default(400),
 		model_tier: z.enum(["inherit", "fast", "reasoning"]).default("inherit"),
-		tags: z.array(z.string().min(1)).default([]),
+		tags: z.array(z.string().min(1).max(64)).max(32).default([]),
 		system_prompt_lines: z.number().int().min(1).max(180).default(1),
 		system_prompt_tokens: z.number().int().min(1).max(1000).default(1),
 	})
 	.strict();
 
+export type SubagentManifestInput = z.input<typeof SubagentManifestSchema>;
 export type SubagentManifest = z.output<typeof SubagentManifestSchema> & {
 	readonly description_tokens: number;
 };
+
+function normalizeManifestFieldAlias(
+	record: Record<string, unknown>,
+	canonicalKey: string,
+	aliases: readonly string[],
+): void {
+	for (const alias of aliases) {
+		if (Object.hasOwn(record, alias) && !Object.hasOwn(record, canonicalKey)) {
+			record[canonicalKey] = record[alias];
+			delete record[alias];
+		}
+	}
+}
 
 export function createSubagentManifest(
 	input: Record<string, unknown>,
 ): SubagentManifest {
 	const normalized: Record<string, unknown> = { ...input };
-	if ("user-invocable" in normalized && !("user_invocable" in normalized)) {
-		normalized.user_invocable = normalized["user-invocable"];
-		delete normalized["user-invocable"];
-	}
-	if (
-		"context-isolation" in normalized &&
-		!("context_isolation" in normalized)
-	) {
-		normalized.context_isolation = normalized["context-isolation"];
-		delete normalized["context-isolation"];
-	}
-	if (
-		"max-output-tokens" in normalized &&
-		!("max_output_tokens" in normalized)
-	) {
-		normalized.max_output_tokens = normalized["max-output-tokens"];
-		delete normalized["max-output-tokens"];
-	}
-	if ("model-tier" in normalized && !("model_tier" in normalized)) {
-		normalized.model_tier = normalized["model-tier"];
-		delete normalized["model-tier"];
-	}
+	normalizeManifestFieldAlias(normalized, "user_invocable", [
+		"user-invocable",
+		"userInvocable",
+	]);
+	normalizeManifestFieldAlias(normalized, "context_isolation", [
+		"context-isolation",
+		"contextIsolation",
+	]);
+	normalizeManifestFieldAlias(normalized, "max_output_tokens", [
+		"max-output-tokens",
+		"maxOutputTokens",
+	]);
+	normalizeManifestFieldAlias(normalized, "model_tier", [
+		"model-tier",
+		"modelTier",
+	]);
+	normalizeManifestFieldAlias(normalized, "disallowed_tools", [
+		"disallowed-tools",
+		"disallowedTools",
+	]);
+	normalizeManifestFieldAlias(normalized, "sandbox_mode", [
+		"sandbox-mode",
+		"sandboxMode",
+	]);
+
 	const parsed = SubagentManifestSchema.parse(normalized);
 	return {
 		...parsed,
@@ -894,12 +1159,17 @@ export function createSubagentManifest(
 	};
 }
 
-export function parseSubagentMdFile(filePath: string): {
+/**
+ * Pure text parser for `SUBAGENT.md` / `*.agent.md` documents (invoked by bounded filesystem readers).
+ */
+export function parseSubagentMdText(
+	rawText: string,
+	sourceLabel: string = "SUBAGENT.md",
+): {
 	manifest: SubagentManifest;
 	systemPromptBody: string;
 } {
-	const rawText = fs.readFileSync(filePath, "utf-8");
-	const normalizedPath = filePath.replace(/\\/g, "/");
+	const normalizedPath = sourceLabel.replace(/\\/g, "/");
 	const [frontmatter, body] = splitFrontmatter(rawText, normalizedPath);
 	const trimmedBody = body.trim();
 	const promptLines = trimmedBody ? trimmedBody.split(/\r?\n/).length : 1;
@@ -919,9 +1189,12 @@ export function parseSubagentMdFile(filePath: string): {
 export const SyncedArtifactSchema = z
 	.object({
 		target: RuntimeTargetSchema,
-		skill_name: z.string().min(1),
-		relative_path: z.string().min(1),
-		sha256: z.string().regex(/^[0-9a-f]{64}$/),
+		skill_name: z.string().min(1).max(128),
+		relative_path: z.string().min(1).max(1024),
+		sha256: z
+			.string()
+			.length(64)
+			.regex(/^[0-9a-f]{64}$/),
 		action: z.enum([
 			"created",
 			"updated",
@@ -935,55 +1208,31 @@ export const SyncedArtifactSchema = z
 	.strict();
 export type SyncedArtifact = z.infer<typeof SyncedArtifactSchema>;
 
-const FORBIDDEN_LOCKFILE_SEGMENTS = new Set([
-	"__proto__",
-	"constructor",
-	"prototype",
-]);
-
-/**
- * Validate that a lockfile relative artifact path or key cannot escape the repository
- * or pollute Object.prototype via '__proto__', 'constructor', or 'prototype'.
- */
-export function isSafeLockRelativePath(value: string): boolean {
-	if (
-		!value ||
-		value.startsWith("/") ||
-		value.startsWith("\\") ||
-		value.includes("\0") ||
-		value.includes("\\") ||
-		value.includes(":")
-	) {
-		return false;
-	}
-	const segments = value.split("/");
-	for (const segment of segments) {
-		if (
-			segment.length === 0 ||
-			segment === "." ||
-			segment === ".." ||
-			FORBIDDEN_LOCKFILE_SEGMENTS.has(segment)
-		) {
-			return false;
-		}
-	}
-	return true;
-}
-
 export const SafeLockRelativePathSchema = z
 	.string()
 	.min(1)
+	.max(1024)
 	.refine(isSafeLockRelativePath, {
 		message:
-			"Lockfile artifact key/path must be a safe relative POSIX path without leading '/', '..', NUL bytes, or prototype-polluting segments ('__proto__', 'constructor', 'prototype').",
+			"Lockfile artifact key/path must be a safe relative POSIX path without leading '/', '..', NUL bytes, reserved device stems, or prototype-polluting segments ('__proto__', 'constructor', 'prototype').",
 	});
 
 export const SyncLockEntrySchema = z
 	.object({
 		target: RuntimeTargetSchema,
-		skill_name: z.string().min(1),
+		skill_name: z
+			.string()
+			.min(1)
+			.max(128)
+			.refine(isSafeCrossPlatformPathSegment, {
+				message:
+					"Lockfile skill_name must be a safe cross-platform identifier.",
+			}),
 		relative_path: SafeLockRelativePathSchema,
-		sha256: z.string().regex(/^[0-9a-f]{64}$/),
+		sha256: z
+			.string()
+			.length(64)
+			.regex(/^[0-9a-f]{64}$/),
 	})
 	.strict();
 export type SyncLockEntry = z.infer<typeof SyncLockEntrySchema>;
@@ -999,7 +1248,14 @@ const PlainArtifactsRecordPrecheckSchema = z.custom<
 		if (proto !== Object.prototype && proto !== null) {
 			return false;
 		}
-		for (const key of Object.getOwnPropertyNames(val)) {
+		if (Object.getOwnPropertySymbols(val).length > 0) {
+			return false;
+		}
+		const keys = Object.getOwnPropertyNames(val);
+		if (keys.length > MAX_LOCKFILE_ARTIFACTS) {
+			return false;
+		}
+		for (const key of keys) {
 			if (!isSafeLockRelativePath(key)) {
 				return false;
 			}
@@ -1008,36 +1264,83 @@ const PlainArtifactsRecordPrecheckSchema = z.custom<
 	},
 	{
 		message:
-			"Lockfile 'artifacts' must be a plain key-value object without prototype-polluting keys ('__proto__', 'constructor', 'prototype'), leading '/', NUL bytes, or '..' segments.",
+			"Lockfile 'artifacts' must be a plain key-value object (<= 4096 keys) without prototype-polluting keys ('__proto__', 'constructor', 'prototype'), leading '/', NUL bytes, reserved device stems, or '..' segments.",
 	},
 );
 
 export const SyncLockfileSchema = z
 	.object({
-		schema_version: z.string().default("1.0"),
-		skillops_version: z.string().min(1),
-		targets: z.array(RuntimeTargetSchema).default([]),
-		selected_skills: z.array(z.string()).default([]),
-		selected_subagents: z.array(z.string()).default([]),
-		total_l1_tokens: z.number().int().min(0).default(0),
+		schema_version: z.string().min(1).max(32).default("1.0"),
+		skillops_version: z.string().min(1).max(64),
+		targets: z.array(RuntimeTargetSchema).max(64).default([]),
+		selected_skills: z.array(z.string().min(1).max(128)).max(512).default([]),
+		selected_subagents: z
+			.array(z.string().min(1).max(128))
+			.max(512)
+			.default([]),
+		total_l1_tokens: z.number().int().min(0).max(10_000_000).default(0),
 		artifacts: PlainArtifactsRecordPrecheckSchema.pipe(
 			z.record(SafeLockRelativePathSchema, SyncLockEntrySchema),
 		).default({}),
 	})
-	.strict();
+	.strict()
+	.superRefine((lockfile, ctx) => {
+		const keys = Object.getOwnPropertyNames(lockfile.artifacts);
+		if (keys.length > MAX_LOCKFILE_ARTIFACTS) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["artifacts"],
+				message: `Lockfile 'artifacts' exceeds maximum of ${MAX_LOCKFILE_ARTIFACTS} entries (got ${keys.length}).`,
+			});
+			return;
+		}
+		const seenLower = new Map<string, string>();
+		for (const key of keys) {
+			const lowerKey = key.toLowerCase();
+			const priorKey = seenLower.get(lowerKey);
+			if (priorKey !== undefined && priorKey !== key) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["artifacts", key],
+					message: `Case-insensitive lockfile artifact key collision between '${priorKey}' and '${key}'.`,
+				});
+			} else {
+				seenLower.set(lowerKey, key);
+			}
+
+			const entry = lockfile.artifacts[key];
+			if (!entry) {
+				continue;
+			}
+			if (key !== entry.relative_path) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["artifacts", key, "relative_path"],
+					message: `Lockfile artifact key '${key}' must exactly match entry.relative_path '${entry.relative_path}'.`,
+				});
+			}
+			if (!isAllowedHarnessArtifactPath(entry.target, key, entry.skill_name)) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["artifacts", key],
+					message: `Lockfile artifact path '${key}' is outside allowed harness directories for target '${entry.target}'.`,
+				});
+			}
+		}
+	});
 export type SyncLockfile = z.infer<typeof SyncLockfileSchema>;
 
 export const SyncReportSchema = z
 	.object({
-		repo_path: z.string().min(1),
-		catalog_path: z.string().min(1),
-		targets: z.array(RuntimeTargetSchema).default([]),
+		repo_path: z.string().min(1).max(4096),
+		catalog_path: z.string().min(1).max(4096),
+		targets: z.array(RuntimeTargetSchema).max(64).default([]),
 		dry_run: z.boolean().default(false),
 		force: z.boolean().default(false),
-		artifacts: z.array(SyncedArtifactSchema).default([]),
-		skipped_existing: z.array(z.string()).default([]),
-		drift_conflicts: z.array(z.string()).default([]),
-		lockfile_path: z.string().min(1),
+		artifacts: z.array(SyncedArtifactSchema).max(4096).default([]),
+		skipped_existing: z.array(z.string().max(1024)).max(4096).default([]),
+		drift_conflicts: z.array(z.string().max(1024)).max(4096).default([]),
+		lockfile_path: z.string().min(1).max(4096),
 		passed: z.boolean().default(true),
 	})
 	.strict();
@@ -1049,9 +1352,9 @@ export type SyncReport = z.infer<typeof SyncReportSchema>;
 
 export const SkillOpsTokenEconomyConfigSchema = z
 	.object({
-		startup_tax_budget: z.number().int().min(100).default(2500),
+		startup_tax_budget: z.number().int().min(100).max(1_000_000).default(2500),
 		max_active_skills: z.number().int().min(1).max(12).default(12),
-		max_l1_tokens: z.number().int().min(40).default(1500),
+		max_l1_tokens: z.number().int().min(40).max(1_000_000).default(1500),
 		max_similarity: z.number().min(0.1).max(0.99).default(0.78),
 	})
 	.strict();
@@ -1061,8 +1364,8 @@ export type SkillOpsTokenEconomyConfig = z.infer<
 
 export const SkillOpsDetectedStackConfigSchema = z
 	.object({
-		languages: z.array(z.string()).default([]),
-		frameworks: z.array(z.string()).default([]),
+		languages: z.array(z.string().min(1).max(128)).max(64).default([]),
+		frameworks: z.array(z.string().min(1).max(128)).max(64).default([]),
 	})
 	.strict();
 export type SkillOpsDetectedStackConfig = z.infer<
@@ -1071,8 +1374,23 @@ export type SkillOpsDetectedStackConfig = z.infer<
 
 export const SkillOpsConfigSchema = z
 	.object({
-		version: z.string().min(1).default("1.0"),
-		catalog_dir: z.string().min(1).default("catalog"),
+		version: z.string().min(1).max(32).default("1.0"),
+		catalog_dir: z
+			.string()
+			.min(1)
+			.max(1024)
+			.transform((val) => {
+				if (val.startsWith("/") || val.startsWith("\\")) {
+					return val;
+				}
+				const trimmed = trimTrailingSlashes(val);
+				return trimmed.startsWith("./") ? trimmed.slice(2) : trimmed;
+			})
+			.refine(isSafeLockRelativePath, {
+				message:
+					"catalog_dir must be a safe relative repository path without '..', leading '/', drive colons, backslashes, NUL bytes, or reserved device stems.",
+			})
+			.default("catalog"),
 		token_economy: SkillOpsTokenEconomyConfigSchema.default({
 			startup_tax_budget: 2500,
 			max_active_skills: 12,
@@ -1086,6 +1404,7 @@ export const SkillOpsConfigSchema = z
 		targets: z
 			.array(RuntimeTargetSchema)
 			.min(1)
+			.max(64)
 			.default([...CORE_RUNTIME_TARGETS]),
 	})
 	.strict();
@@ -1099,40 +1418,30 @@ export interface LoadedSkillOpsConfigResult {
 }
 
 /**
- * Load and validate `.skillops.yml` from a repository root if present.
+ * Pure YAML parser and schema validator for `.skillops.yml` configuration text,
+ * enforcing `{ maxAliasCount: 0, uniqueKeys: true }` and `<= 64 KiB` byte budget.
  */
-export function loadSkillOpsConfig(
-	repoPath: string,
-): LoadedSkillOpsConfigResult {
-	const configPath = `${trimTrailingSlashes(repoPath.replace(/\\/g, "/"))}/.skillops.yml`;
-	if (!fs.existsSync(configPath) || !fs.statSync(configPath).isFile()) {
-		return {
-			config: null,
-			configPath,
-			exists: false,
-			error: null,
-		};
+export function parseSkillOpsConfigText(rawYaml: string): SkillOpsConfig {
+	if (Buffer.byteLength(rawYaml, "utf-8") > MAX_RAW_CONFIG_BYTES) {
+		throw new Error(
+			`Security violation: .skillops.yml exceeds maximum allowed size of ${MAX_RAW_CONFIG_BYTES} bytes.`,
+		);
 	}
-
-	try {
-		const rawYaml = fs.readFileSync(configPath, "utf-8");
-		const parsedYaml: unknown = YAML.parse(rawYaml);
-		const validated = SkillOpsConfigSchema.parse(parsedYaml);
-		return {
-			config: validated,
-			configPath,
-			exists: true,
-			error: null,
-		};
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		return {
-			config: null,
-			configPath,
-			exists: true,
-			error: message,
-		};
+	const parsedYaml: unknown = YAML.parse(rawYaml, {
+		maxAliasCount: 0,
+		uniqueKeys: true,
+	});
+	if (
+		parsedYaml &&
+		typeof parsedYaml === "object" &&
+		!Array.isArray(parsedYaml) &&
+		hasForbiddenOwnPrototypeKey(parsedYaml)
+	) {
+		throw new Error(
+			"Security violation: .skillops.yml contains forbidden prototype keys.",
+		);
 	}
+	return SkillOpsConfigSchema.parse(parsedYaml);
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,14 +1459,20 @@ export type ScriptOutputStatus = z.infer<typeof ScriptOutputStatusSchema>;
 
 export const ScriptOutputSchema = z
 	.object({
-		skill: z.string().regex(SKILL_NAME_REGEX),
-		script: z.string().min(1),
+		skill: z.string().min(1).max(128).regex(SKILL_NAME_REGEX),
+		script: z.string().min(1).max(512),
 		status: ScriptOutputStatusSchema,
-		target: z.string().min(1),
-		summary: z.union([z.record(z.string(), z.unknown()), z.string()]),
-		findings: z.array(z.record(z.string(), z.unknown())).default([]),
-		data: z.record(z.string(), z.unknown()).optional(),
-		metrics: z.record(z.string(), z.unknown()).optional(),
+		target: z.string().min(1).max(2048),
+		summary: z.union([
+			z.record(z.string().max(256), z.unknown()),
+			z.string().max(16_384),
+		]),
+		findings: z
+			.array(z.record(z.string().max(256), z.unknown()))
+			.max(10_000)
+			.default([]),
+		data: z.record(z.string().max(256), z.unknown()).optional(),
+		metrics: z.record(z.string().max(256), z.unknown()).optional(),
 	})
 	.strict();
 export type ScriptOutput = z.infer<typeof ScriptOutputSchema>;
@@ -1176,31 +1491,79 @@ export type EvalAssertionType = z.infer<typeof EvalAssertionTypeSchema>;
 
 export const EvalAssertionSchema = z
 	.object({
-		id: z.string().min(1),
+		id: z.string().min(1).max(128),
 		type: EvalAssertionTypeSchema,
-		target: z.string().min(1),
+		target: z.string().min(1).max(512),
 		expected: z.unknown().optional(),
-		description: z.string().min(1),
+		description: z.string().min(1).max(2048),
 	})
 	.strict();
 export type EvalAssertion = z.infer<typeof EvalAssertionSchema>;
 
-export const EvalCaseSchema = z
+const CanonicalEvalCaseSchema = z
 	.object({
-		id: z.string().min(1),
-		name: z.string().min(1),
-		prompt: z.string().min(1),
-		fixtures: z.array(z.string()).default([]),
-		assertions: z.array(EvalAssertionSchema).min(1),
+		id: z.string().min(1).max(128),
+		name: z.string().min(1).max(256),
+		prompt: z.string().min(1).max(32_768),
+		fixtures: z.array(z.string().min(1).max(1024)).max(64).default([]),
+		assertions: z.array(EvalAssertionSchema).min(1).max(128),
 	})
 	.strict();
+
+const ShorthandEvalCaseSchema = z
+	.object({
+		id: z.union([
+			z.string().min(1).max(128),
+			z.number().int().nonnegative().transform(String),
+		]),
+		name: z.string().min(1).max(256).optional(),
+		prompt: z.string().min(1).max(32_768),
+		expected_output: z.string().min(1).max(32_768),
+		files: z.array(z.string().min(1).max(1024)).max(64).optional(),
+		fixtures: z.array(z.string().min(1).max(1024)).max(64).optional(),
+		assertions: z
+			.array(z.union([EvalAssertionSchema, z.string().min(1).max(2048)]))
+			.min(1)
+			.max(128),
+	})
+	.strict()
+	.transform((raw) => ({
+		id: raw.id,
+		name: raw.name ?? raw.prompt.slice(0, 256),
+		prompt: raw.prompt,
+		fixtures: raw.fixtures ?? raw.files ?? [],
+		assertions: raw.assertions.map((assertion, idx) =>
+			typeof assertion === "string"
+				? {
+						id: `${raw.id}-assertion-${idx + 1}`,
+						type: "contains" as const,
+						target: "output",
+						expected: raw.expected_output,
+						description: assertion,
+					}
+				: assertion,
+		),
+	}));
+
+export const EvalCaseSchema = z.union([
+	CanonicalEvalCaseSchema,
+	ShorthandEvalCaseSchema,
+]);
 export type EvalCase = z.infer<typeof EvalCaseSchema>;
 
 export const EvalSuiteSchema = z
 	.object({
-		skill_name: z.string().regex(SKILL_NAME_REGEX),
-		schema_version: z.string().min(1).default("1.0"),
-		evals: z.array(EvalCaseSchema).min(1),
+		skill_name: z
+			.string()
+			.min(1)
+			.max(128)
+			.regex(SKILL_NAME_REGEX)
+			.refine(isSafeCrossPlatformPathSegment, {
+				message:
+					"EvalSuite skill_name cannot be a reserved cross-platform device stem.",
+			}),
+		schema_version: z.string().min(1).max(32).default("1.0"),
+		evals: z.array(EvalCaseSchema).min(1).max(128),
 	})
 	.strict();
 export type EvalSuite = z.infer<typeof EvalSuiteSchema>;
@@ -1208,9 +1571,9 @@ export type EvalSuite = z.infer<typeof EvalSuiteSchema>;
 export const BenchmarkRunStatsSchema = z
 	.object({
 		pass_rate_mean: z.number().min(0).max(1),
-		pass_rate_stddev: z.number().min(0).default(0),
-		tokens_mean: z.number().min(0),
-		latency_ms_mean: z.number().min(0),
+		pass_rate_stddev: z.number().min(0).max(1).default(0),
+		tokens_mean: z.number().min(0).max(10_000_000),
+		latency_ms_mean: z.number().min(0).max(86_400_000),
 	})
 	.strict();
 export type BenchmarkRunStats = z.infer<typeof BenchmarkRunStatsSchema>;
@@ -1225,7 +1588,7 @@ export type BenchmarkVerdict = z.infer<typeof BenchmarkVerdictSchema>;
 export const BenchmarkDeltaSchema = z
 	.object({
 		pass_rate_gain: z.number().min(-1).max(1),
-		token_reduction_pct: z.number(),
+		token_reduction_pct: z.number().min(-100_000).max(100),
 		verdict: BenchmarkVerdictSchema,
 	})
 	.strict();
@@ -1233,9 +1596,17 @@ export type BenchmarkDelta = z.infer<typeof BenchmarkDeltaSchema>;
 
 export const BenchmarkReportSchema = z
 	.object({
-		skill_name: z.string().regex(SKILL_NAME_REGEX),
-		runner: z.string().min(1),
-		timestamp: z.string().datetime({ offset: true }),
+		skill_name: z
+			.string()
+			.min(1)
+			.max(128)
+			.regex(SKILL_NAME_REGEX)
+			.refine(isSafeCrossPlatformPathSegment, {
+				message:
+					"BenchmarkReport skill_name cannot be a reserved cross-platform device stem.",
+			}),
+		runner: z.string().min(1).max(256),
+		timestamp: z.string().max(64).datetime({ offset: true }),
 		with_skill: BenchmarkRunStatsSchema,
 		without_skill: BenchmarkRunStatsSchema,
 		delta: BenchmarkDeltaSchema,
