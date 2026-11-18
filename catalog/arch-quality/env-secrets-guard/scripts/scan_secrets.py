@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import stat
 import struct
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +27,26 @@ SKIP_DIRS = {
     "coverage",
     ".tox",
     ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
 }
-MAX_FILE_BYTES = 1_000_000
+MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_LINE_LENGTH = 4096
 EXAMPLE_SUFFIXES = (".example", ".sample", ".template", ".dist")
+
+_NTFS_REPARSE_LINKS = (0xA0000003, 0xA000000C)
+_WINDOWS_DEVICE_STEMS = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{idx}" for idx in range(1, 10)),
+        *(f"LPT{idx}" for idx in range(1, 10)),
+    }
+)
 
 AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
 GITHUB_TOKEN_RE = re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b")
@@ -37,7 +56,18 @@ GOOGLE_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")
 HUGGINGFACE_TOKEN_RE = re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")
 SLACK_TOKEN_RE = re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}")
 PRIVATE_KEY_BLOCK_RE = re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")
-ASSIGNMENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{0,80})\s*[:=]\s*[\"']?([^\s\"'#;,]{8,160})[\"']?")
+ASSIGNMENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{0,80})[\"']?\s*[:=]\s*[\"']?([^\s\x00\"'#;,{}]{8,160})[\"']?")
+
+PROVIDER_TOKEN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("aws-access-key-id", AWS_ACCESS_KEY_RE),
+    ("github-token", GITHUB_TOKEN_RE),
+    ("anthropic-api-key", ANTHROPIC_KEY_RE),
+    ("openai-api-key", OPENAI_KEY_RE),
+    ("google-api-key", GOOGLE_API_KEY_RE),
+    ("huggingface-token", HUGGINGFACE_TOKEN_RE),
+    ("slack-token", SLACK_TOKEN_RE),
+    ("private-key-block", PRIVATE_KEY_BLOCK_RE),
+)
 
 SENSITIVE_KEYWORDS = (
     "API_KEY",
@@ -88,6 +118,90 @@ CODE_LOOKUP_PREFIXES = (
 )
 
 
+def _sanitize_label(raw: str) -> str:
+    cleaned = raw.replace("\x00", "\\x00").strip()
+    return cleaned or "<empty>"
+
+
+def _has_unsafe_path_syntax(path: Path) -> bool:
+    raw = str(path)
+    if "\x00" in raw:
+        return True
+    parts = path.parts[1:] if (path.drive or path.root) else path.parts
+    for part in parts:
+        if ":" in part:
+            return True
+        stem = part.split(".", 1)[0].strip().upper()
+        if stem in _WINDOWS_DEVICE_STEMS:
+            return True
+    return False
+
+
+def _is_symlink_or_junction(path: Path) -> bool:
+    """Return True when path is a symlink or NTFS junction without following it."""
+    try:
+        if path.is_symlink():
+            return True
+    except (OSError, ValueError):
+        return True
+    try:
+        if path.is_junction():
+            return True
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        st = path.lstat()
+    except (OSError, ValueError):
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    try:
+        return st.st_reparse_tag in _NTFS_REPARSE_LINKS
+    except AttributeError:
+        return False
+
+
+def _has_symlink_ancestor(target: Path) -> bool:
+    if _is_symlink_or_junction(target):
+        return True
+    if not target.is_absolute():
+        cur = Path(".")
+        for part in target.parts:
+            if part in ("", "."):
+                continue
+            cur = cur / part
+            if _is_symlink_or_junction(cur):
+                return True
+        return False
+
+    exempt: set[Path] = set()
+    for base_dir in (Path.cwd(), Path(tempfile.gettempdir())):
+        exempt.add(base_dir)
+        exempt.update(base_dir.parents)
+    for parent in target.parents:
+        if parent in exempt:
+            break
+        if _is_symlink_or_junction(parent):
+            return True
+    return False
+
+
+def _is_safe_regular_file_within(path: Path, root_real: Path) -> bool:
+    if _has_unsafe_path_syntax(path) or path.is_symlink() or _is_symlink_or_junction(path):
+        return False
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_BYTES:
+        return False
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved.is_relative_to(root_real)
+
+
 def _redact(value: str) -> str:
     return f"{value[:4]}***" if len(value) > 4 else "***"
 
@@ -108,9 +222,9 @@ def _is_placeholder(value: str) -> bool:
     return open_angle != -1 and value.find(">", open_angle + 1) != -1
 
 
-def _is_dynamic_code_expr(matched_text: str, value: str) -> bool:
-    rhs = matched_text.split("=", 1)[-1] if "=" in matched_text else matched_text.split(":", 1)[-1]
-    rhs_stripped = rhs.strip()
+def _is_dynamic_code_expr(matched_text: str, key_name: str, value: str) -> bool:
+    after_key = matched_text[len(key_name) :].lstrip("\"' \t")
+    rhs_stripped = after_key[1:].strip() if after_key and after_key[0] in (":", "=") else ""
     is_quoted = (
         len(rhs_stripped) >= 2
         and rhs_stripped[0] in ("'", '"')
@@ -156,29 +270,73 @@ def _wildcard_match(text: str, pattern: str) -> bool:
     return p_idx == p_len
 
 
-def _resolve_git_dir(root: Path) -> Path | None:
+def _resolve_git_dir(root: Path, root_real: Path) -> Path | None:
     dot_git = root / ".git"
-    if dot_git.is_dir():
-        return dot_git
-    if dot_git.is_file():
+    if _has_unsafe_path_syntax(dot_git) or dot_git.is_symlink() or _is_symlink_or_junction(dot_git):
+        return None
+    try:
+        st = dot_git.lstat()
+    except OSError:
+        return None
+
+    if stat.S_ISDIR(st.st_mode):
         try:
-            first_line = dot_git.read_text(encoding="utf-8", errors="replace").splitlines()[0]
-        except (IndexError, OSError):
+            resolved_dir = dot_git.resolve()
+        except OSError:
             return None
-        if first_line.startswith("gitdir:"):
-            raw_target = first_line.partition(":")[2].strip()
-            resolved = (root / raw_target).resolve()
-            if resolved.is_dir():
-                return resolved
+        return dot_git if resolved_dir.is_relative_to(root_real) else None
+
+    if stat.S_ISREG(st.st_mode):
+        if st.st_size > MAX_FILE_BYTES:
+            return None
+        try:
+            lines = dot_git.read_text(encoding="utf-8", errors="replace").splitlines()
+            first_line = lines[0] if lines else ""
+        except OSError:
+            return None
+        if len(first_line) > MAX_LINE_LENGTH or not first_line.startswith("gitdir:"):
+            return None
+        raw_target = first_line.partition(":")[2].strip()
+        if not raw_target or "\x00" in raw_target:
+            return None
+        candidate = root / raw_target
+        if (
+            _has_unsafe_path_syntax(candidate)
+            or candidate.is_symlink()
+            or _is_symlink_or_junction(candidate)
+        ):
+            return None
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return None
+        if not resolved.is_relative_to(root_real):
+            return None
+        # Verify no intermediate segment between root_real and resolved is a symlink/junction
+        try:
+            rel_parts = resolved.relative_to(root_real).parts
+        except ValueError:
+            return None
+        cur = root_real
+        for part in rel_parts:
+            cur = cur / part
+            if cur.is_symlink() or _is_symlink_or_junction(cur):
+                return None
+        try:
+            target_st = resolved.lstat()
+        except OSError:
+            return None
+        if stat.S_ISDIR(target_st.st_mode):
+            return resolved
     return None
 
 
-def _read_git_index_paths(git_dir: Path | None) -> set[str]:
+def _read_git_index_paths(git_dir: Path | None, root_real: Path) -> set[str]:
     """Parse standard Git DIRC v2/v3 index binary using stdlib struct to detect tracked files."""
     if git_dir is None:
         return set()
     index_path = git_dir / "index"
-    if not index_path.is_file():
+    if not _is_safe_regular_file_within(index_path, root_real):
         return set()
     try:
         data = index_path.read_bytes()
@@ -234,35 +392,55 @@ def _matches_gitignore_rule(rel: str, name: str, raw_pattern: str) -> bool:
     return _wildcard_match(name, clean) or _wildcard_match(rel, clean)
 
 
-def _collect_ignore_files(root: Path, rel: str, git_dir: Path | None) -> list[tuple[Path, str]]:
+def _collect_ignore_files(
+    root: Path,
+    root_real: Path,
+    rel: str,
+    git_dir: Path | None,
+) -> list[tuple[Path, str]]:
     """Return [(ignore_file, rel_to_ignore_dir)] ordered from repo exclude down to deepest subdir."""
     candidates: list[tuple[Path, str]] = []
     if git_dir is not None:
-        exclude = git_dir / "info" / "exclude"
-        if exclude.is_file():
+        info_dir = git_dir / "info"
+        exclude = info_dir / "exclude"
+        if (
+            not info_dir.is_symlink()
+            and not _is_symlink_or_junction(info_dir)
+            and _is_safe_regular_file_within(exclude, root_real)
+        ):
             candidates.append((exclude, rel))
 
     parts = Path(rel).parts
     current_dir = root
     for depth in range(len(parts)):
+        if current_dir != root:
+            if current_dir.is_symlink() or _is_symlink_or_junction(current_dir):
+                break
+            try:
+                if not current_dir.resolve().is_relative_to(root_real):
+                    break
+            except OSError:
+                break
         gitignore = current_dir / ".gitignore"
         sub_rel = "/".join(parts[depth:])
-        if gitignore.is_file():
+        if _is_safe_regular_file_within(gitignore, root_real):
             candidates.append((gitignore, sub_rel))
         if depth < len(parts) - 1:
             current_dir = current_dir / parts[depth]
     return candidates
 
 
-def _is_ignored(root: Path, rel: str, git_dir: Path | None) -> bool:
+def _is_ignored(root: Path, root_real: Path, rel: str, git_dir: Path | None) -> bool:
     ignored = False
     name = Path(rel).name
-    for ignore_file, scoped_rel in _collect_ignore_files(root, rel, git_dir):
+    for ignore_file, scoped_rel in _collect_ignore_files(root, root_real, rel, git_dir):
         try:
             lines = ignore_file.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
         for raw_line in lines:
+            if len(raw_line) > MAX_LINE_LENGTH:
+                continue
             stripped = raw_line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
@@ -273,14 +451,40 @@ def _is_ignored(root: Path, rel: str, git_dir: Path | None) -> bool:
     return ignored
 
 
-def _walk(root: Path) -> list[Path]:
+def _walk(root: Path, root_real: Path) -> list[Path]:
     files: list[Path] = []
-    for path in sorted(root.rglob("*")):
-        rel_parts = path.relative_to(root).parts
-        if any(part in SKIP_DIRS for part in rel_parts[:-1]):
+    stack: list[Path] = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = sorted(current.iterdir(), key=lambda item: item.name)
+        except OSError:
             continue
-        if path.is_file() and not path.is_symlink():
-            files.append(path)
+        subdirs: list[Path] = []
+        for entry in entries:
+            if _has_unsafe_path_syntax(entry) or entry.is_symlink() or _is_symlink_or_junction(entry):
+                continue
+            try:
+                st = entry.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            try:
+                resolved = entry.resolve()
+            except OSError:
+                continue
+            if not resolved.is_relative_to(root_real):
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                if entry.name in SKIP_DIRS:
+                    continue
+                subdirs.append(entry)
+            elif stat.S_ISREG(st.st_mode):
+                files.append(entry)
+        for subdir in reversed(subdirs):
+            stack.append(subdir)
+    files.sort(key=lambda item: item.relative_to(root).as_posix())
     return files
 
 
@@ -288,6 +492,7 @@ def _finding(rel: str, line: int, rule: str, severity: str, impact: str) -> dict
     return {
         "file": rel,
         "line": line,
+        "rule": rule,
         "symbol": rule,
         "impact": impact,
         "severity": severity,
@@ -295,29 +500,21 @@ def _finding(rel: str, line: int, rule: str, severity: str, impact: str) -> dict
 
 
 def _scan_provider_tokens(rel: str, lineno: int, line: str) -> list[dict[str, Any]]:
-    checks = (
-        ("aws-access-key-id", AWS_ACCESS_KEY_RE.search(line)),
-        ("github-token", GITHUB_TOKEN_RE.search(line)),
-        ("anthropic-api-key", ANTHROPIC_KEY_RE.search(line)),
-        ("openai-api-key", OPENAI_KEY_RE.search(line)),
-        ("google-api-key", GOOGLE_API_KEY_RE.search(line)),
-        ("huggingface-token", HUGGINGFACE_TOKEN_RE.search(line)),
-        ("slack-token", SLACK_TOKEN_RE.search(line)),
-        ("private-key-block", PRIVATE_KEY_BLOCK_RE.search(line)),
-    )
     results: list[dict[str, Any]] = []
-    for rule, match in checks:
-        if match and not _is_placeholder(match.group(0)):
-            results.append(
-                _finding(
-                    rel,
-                    lineno,
-                    rule,
-                    "error",
-                    f"Hardcoded credential detected ({_redact(match.group(0))}); "
-                    "move it to an environment variable and rotate it.",
+    for rule, pattern in PROVIDER_TOKEN_RULES:
+        for match in pattern.finditer(line):
+            token = match.group(0)
+            if not _is_placeholder(token):
+                results.append(
+                    _finding(
+                        rel,
+                        lineno,
+                        rule,
+                        "error",
+                        f"Hardcoded credential detected ({_redact(token)}); "
+                        "move it to an environment variable and rotate it.",
+                    )
                 )
-            )
     return results
 
 
@@ -326,14 +523,15 @@ def _has_sensitive_key_name(raw_key: str) -> bool:
     return any(keyword in upper_key for keyword in SENSITIVE_KEYWORDS)
 
 
-def scan_repo(root: Path) -> tuple[list[dict[str, Any]], int]:
+def scan_repo(root: Path, root_real: Path | None = None) -> tuple[list[dict[str, Any]], int]:
     """Return (findings, files_scanned) for the directory tree under root."""
+    resolved_root = root_real if root_real is not None else root.resolve()
     findings: list[dict[str, Any]] = []
     scanned = 0
-    git_dir = _resolve_git_dir(root)
-    tracked_paths = _read_git_index_paths(git_dir)
+    git_dir = _resolve_git_dir(root, resolved_root)
+    tracked_paths = _read_git_index_paths(git_dir, resolved_root)
 
-    for path in _walk(root):
+    for path in _walk(root, resolved_root):
         rel = path.relative_to(root).as_posix()
         name = path.name
 
@@ -348,7 +546,7 @@ def scan_repo(root: Path) -> tuple[list[dict[str, Any]], int]:
                         "Environment file is tracked by git; remove it from the index and rotate its secrets.",
                     )
                 )
-            elif not _is_ignored(root, rel, git_dir):
+            elif not _is_ignored(root, resolved_root, rel, git_dir):
                 findings.append(
                     _finding(
                         rel,
@@ -361,27 +559,57 @@ def scan_repo(root: Path) -> tuple[list[dict[str, Any]], int]:
             continue  # real .env files hold secrets by design; never scan or print their content
 
         try:
-            if path.stat().st_size > MAX_FILE_BYTES:
-                continue
+            st = path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_size > MAX_FILE_BYTES:
+            findings.append(
+                _finding(
+                    rel,
+                    1,
+                    "skipped-oversized-file",
+                    "warning",
+                    f"File '{rel}' ({st.st_size} bytes) exceeds the {MAX_FILE_BYTES}-byte limit "
+                    "and was skipped.",
+                )
+            )
+            continue
+
+        try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
         scanned += 1
 
+        long_line_warned = False
         for lineno, line in enumerate(text.splitlines(), start=1):
             if len(line) > MAX_LINE_LENGTH:
+                if not long_line_warned:
+                    findings.append(
+                        _finding(
+                            rel,
+                            lineno,
+                            "skipped-long-line",
+                            "warning",
+                            f"Line {lineno} exceeds {MAX_LINE_LENGTH} characters ({len(line)} chars) "
+                            "and was skipped to prevent ReDoS; inspect minified lines manually.",
+                        )
+                    )
+                    long_line_warned = True
                 continue
+
             token_hits = _scan_provider_tokens(rel, lineno, line)
             findings.extend(token_hits)
 
-            assign_match = ASSIGNMENT_RE.search(line)
-            if assign_match:
+            for assign_match in ASSIGNMENT_RE.finditer(line):
                 key_name = assign_match.group(1)
                 secret_val = assign_match.group(2)
                 if (
                     _has_sensitive_key_name(key_name)
                     and not _is_placeholder(secret_val)
-                    and not _is_dynamic_code_expr(assign_match.group(0), secret_val)
+                    and not _is_dynamic_code_expr(assign_match.group(0), key_name, secret_val)
                 ):
                     findings.append(
                         _finding(
@@ -397,6 +625,33 @@ def scan_repo(root: Path) -> tuple[list[dict[str, Any]], int]:
     return findings, scanned
 
 
+def _emit_invalid_root(target_label: str, as_json: bool) -> int:
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "skill": SKILL,
+                    "script": SCRIPT,
+                    "status": "error",
+                    "target": target_label,
+                    "summary": {"files_scanned": 0, "findings_count": 0},
+                    "findings": [],
+                    "data": {"files_scanned": 0, "findings": []},
+                    "metrics": {
+                        "files_scanned": 0,
+                        "findings_count": 0,
+                        "errors": 0,
+                        "warnings": 0,
+                    },
+                },
+                indent=2,
+            )
+        )
+    else:
+        sys.stderr.write(f"error: invalid or unsafe directory: {target_label}\n")
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint: exit 0 clean, 1 findings, 2 invalid path."""
     parser = argparse.ArgumentParser(
@@ -406,26 +661,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", dest="as_json", help="Emit JSON output.")
     args = parser.parse_args(argv)
 
-    root = Path(args.path)
-    if not root.is_dir():
-        if args.as_json:
-            print(
-                json.dumps(
-                    {
-                        "skill": SKILL,
-                        "script": SCRIPT,
-                        "status": "error",
-                        "target": root.as_posix(),
-                        "summary": {"files_scanned": 0, "findings_count": 0},
-                        "findings": [],
-                    }
-                )
-            )
-        else:
-            print(f"error: not a directory: {root}")
-        return 2
+    raw_arg = args.path
+    if not raw_arg or not raw_arg.strip() or "\x00" in raw_arg:
+        return _emit_invalid_root(_sanitize_label(raw_arg), args.as_json)
 
-    findings, scanned = scan_repo(root)
+    root = Path(raw_arg)
+    target_label = root.as_posix() or "."
+    if _has_unsafe_path_syntax(root) or _has_symlink_ancestor(root):
+        return _emit_invalid_root(target_label, args.as_json)
+
+    try:
+        root_st = root.lstat()
+    except OSError:
+        return _emit_invalid_root(target_label, args.as_json)
+    if not stat.S_ISDIR(root_st.st_mode):
+        return _emit_invalid_root(target_label, args.as_json)
+
+    try:
+        root_real = root.resolve()
+    except OSError:
+        return _emit_invalid_root(target_label, args.as_json)
+
+    findings, scanned = scan_repo(root, root_real)
+    errors = sum(1 for item in findings if item["severity"] == "error")
+    warnings = sum(1 for item in findings if item["severity"] == "warning")
     status = "ok" if not findings else "findings_detected"
     if args.as_json:
         print(
@@ -434,14 +693,24 @@ def main(argv: list[str] | None = None) -> int:
                     "skill": SKILL,
                     "script": SCRIPT,
                     "status": status,
-                    "target": root.as_posix(),
+                    "target": target_label,
                     "summary": {
                         "files_scanned": scanned,
                         "findings_count": len(findings),
-                        "errors": sum(f["severity"] == "error" for f in findings),
-                        "warnings": sum(f["severity"] == "warning" for f in findings),
+                        "errors": errors,
+                        "warnings": warnings,
                     },
                     "findings": findings,
+                    "data": {
+                        "files_scanned": scanned,
+                        "findings": findings,
+                    },
+                    "metrics": {
+                        "files_scanned": scanned,
+                        "findings_count": len(findings),
+                        "errors": errors,
+                        "warnings": warnings,
+                    },
                 },
                 indent=2,
             )

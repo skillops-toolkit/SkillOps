@@ -12,13 +12,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 SKILL = "context-budget-profiler"
 SCRIPT = "profile_context_budget.py"
 
+MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_LINES_THRESHOLD = 500
 MAX_WORDS_THRESHOLD = 2500
 SKILL_RECOMMENDED_LINES = 250
@@ -26,6 +29,20 @@ SKILL_L1_TOKEN_CAP = 160
 DEFAULT_STARTUP_BUDGET = 2500
 
 PUNCT_CODE_CHARS = frozenset("{}[]()<>:;,.=`~@#$%^&*|\\/")
+
+_NTFS_REPARSE_LINKS = (0xA0000003, 0xA000000C)
+_WINDOWS_DEVICE_STEMS = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{idx}" for idx in range(1, 10)),
+        *(f"LPT{idx}" for idx in range(1, 10)),
+    }
+)
 
 ALWAYS_ON_REL_PATHS = (
     "CLAUDE.md",
@@ -47,26 +64,25 @@ ALWAYS_ON_REL_PATHS = (
     "AGENT.md",
 )
 
-RULE_DIR_GLOBS = (
-    ".cursor/rules/*",
-    ".github/instructions/*",
-    ".windsurf/rules/*",
-    ".roo/rules/*",
-    ".kiro/steering/*",
+RULE_DIRS: tuple[tuple[str, ...], ...] = (
+    (".cursor", "rules"),
+    (".github", "instructions"),
+    (".windsurf", "rules"),
+    (".roo", "rules"),
+    (".kiro", "steering"),
 )
 
-SKILL_GLOBS = (
-    ".claude/skills/*/SKILL.md",
-    ".agent/skills/*/SKILL.md",
-    ".codex/skills/*/SKILL.md",
-    ".gemini/skills/*/SKILL.md",
+SKILL_PARENT_DIRS: tuple[tuple[str, ...], ...] = (
+    (".claude", "skills"),
+    (".agent", "skills"),
+    (".codex", "skills"),
+    (".gemini", "skills"),
 )
 
-SUBAGENT_GLOBS = (
-    "catalog/subagents/*/SUBAGENT.md",
-    ".claude/agents/*.md",
-    ".agent/agents/*.md",
-    ".github/agents/*.agent.md",
+SUBAGENT_FLAT_DIRS: tuple[tuple[tuple[str, ...], str], ...] = (
+    ((".claude", "agents"), ".md"),
+    ((".agent", "agents"), ".md"),
+    ((".github", "agents"), ".agent.md"),
 )
 
 SKIP_DIRS = {
@@ -77,8 +93,175 @@ SKIP_DIRS = {
     ".venv",
     "venv",
     "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
     ".worktrees",
 }
+
+
+def _sanitize_label(raw: str) -> str:
+    cleaned = raw.replace("\x00", "\\x00").strip()
+    return cleaned or "<empty>"
+
+
+def _has_unsafe_path_syntax(path: Path) -> bool:
+    raw = str(path)
+    if "\x00" in raw:
+        return True
+    parts = path.parts[1:] if (path.drive or path.root) else path.parts
+    for part in parts:
+        if ":" in part:
+            return True
+        stem = part.split(".", 1)[0].strip().upper()
+        if stem in _WINDOWS_DEVICE_STEMS:
+            return True
+    return False
+
+
+def _is_symlink_or_junction(path: Path) -> bool:
+    """Return True when path is a symlink or NTFS junction without following it."""
+    try:
+        if path.is_symlink():
+            return True
+    except (OSError, ValueError):
+        return True
+    try:
+        if path.is_junction():
+            return True
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        st = path.lstat()
+    except (OSError, ValueError):
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    try:
+        return st.st_reparse_tag in _NTFS_REPARSE_LINKS
+    except AttributeError:
+        return False
+
+
+def _has_symlink_ancestor(target: Path) -> bool:
+    if _is_symlink_or_junction(target):
+        return True
+    if not target.is_absolute():
+        cur = Path(".")
+        for part in target.parts:
+            if part in ("", "."):
+                continue
+            cur = cur / part
+            if _is_symlink_or_junction(cur):
+                return True
+        return False
+
+    exempt: set[Path] = set()
+    for base_dir in (Path.cwd(), Path(tempfile.gettempdir())):
+        exempt.add(base_dir)
+        exempt.update(base_dir.parents)
+    for parent in target.parents:
+        if parent in exempt:
+            break
+        if _is_symlink_or_junction(parent):
+            return True
+    return False
+
+
+def _resolve_safe_subdir(repo: Path, repo_real: Path, segments: tuple[str, ...]) -> Path | None:
+    current = repo
+    for seg in segments:
+        if seg in SKIP_DIRS:
+            return None
+        current = current / seg
+        if _has_unsafe_path_syntax(current) or current.is_symlink() or _is_symlink_or_junction(current):
+            return None
+        try:
+            st = current.lstat()
+        except OSError:
+            return None
+        if not stat.S_ISDIR(st.st_mode):
+            return None
+        try:
+            resolved = current.resolve()
+        except OSError:
+            return None
+        if not resolved.is_relative_to(repo_real):
+            return None
+    return current
+
+
+def _has_safe_rel_chain(repo: Path, repo_real: Path, candidate: Path) -> bool:
+    try:
+        rel_parts = candidate.relative_to(repo).parts
+    except ValueError:
+        return False
+    if not rel_parts:
+        return False
+    if any(part in SKIP_DIRS for part in rel_parts[:-1]):
+        return False
+    cur = repo
+    last_idx = len(rel_parts) - 1
+    for idx, part in enumerate(rel_parts):
+        cur = cur / part
+        if _has_unsafe_path_syntax(cur) or cur.is_symlink() or _is_symlink_or_junction(cur):
+            return False
+        try:
+            st = cur.lstat()
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode):
+            return False
+        if idx == last_idx:
+            if not stat.S_ISREG(st.st_mode):
+                return False
+        elif not stat.S_ISDIR(st.st_mode):
+            return False
+        try:
+            resolved = cur.resolve()
+        except OSError:
+            return False
+        if not resolved.is_relative_to(repo_real):
+            return False
+    return True
+
+
+def _walk_named_files(root_dir: Path, repo_real: Path, filename: str) -> list[Path]:
+    found: list[Path] = []
+    stack: list[Path] = [root_dir]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = sorted(current.iterdir(), key=lambda item: item.name)
+        except OSError:
+            continue
+        subdirs: list[Path] = []
+        for entry in entries:
+            if _has_unsafe_path_syntax(entry) or entry.is_symlink() or _is_symlink_or_junction(entry):
+                continue
+            try:
+                st = entry.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            try:
+                resolved = entry.resolve()
+            except OSError:
+                continue
+            if not resolved.is_relative_to(repo_real):
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                if entry.name in SKIP_DIRS:
+                    continue
+                subdirs.append(entry)
+            elif stat.S_ISREG(st.st_mode) and entry.name == filename:
+                found.append(entry)
+        for subdir in reversed(subdirs):
+            stack.append(subdir)
+    found.sort(key=lambda item: item.as_posix())
+    return found
 
 
 def estimate_tokens(text: str) -> int:
@@ -170,18 +353,18 @@ def _extract_heavy_sections(body: str, limit: int = 3) -> list[dict[str, Any]]:
     return scored[:limit]
 
 
-def _discover_context_files(repo: Path) -> list[tuple[Path, str]]:
+def _discover_context_files(repo: Path, repo_real: Path) -> list[tuple[Path, str]]:
     seen: set[Path] = set()
     discovered: list[tuple[Path, str]] = []
 
     def _add(candidate: Path, default_tier: str) -> None:
-        if not candidate.exists() or candidate.is_symlink() or not candidate.is_file():
+        if not _has_safe_rel_chain(repo, repo_real, candidate):
             return
-        rel_parts = candidate.relative_to(repo).parts
-        if any(part in SKIP_DIRS for part in rel_parts[:-1]):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
             return
-        resolved = candidate.resolve()
-        if resolved in seen:
+        if not resolved.is_relative_to(repo_real) or resolved in seen:
             return
         seen.add(resolved)
         discovered.append((candidate, default_tier))
@@ -190,30 +373,77 @@ def _discover_context_files(repo: Path) -> list[tuple[Path, str]]:
         _add(repo / rel_path, "always-on")
 
     clinerules = repo / ".clinerules"
-    if clinerules.is_file():
-        _add(clinerules, "always-on")
-    elif clinerules.is_dir() and not clinerules.is_symlink():
-        for child in sorted(clinerules.glob("*")):
-            if child.suffix in {".md", ".mdc", ".txt"}:
-                _add(child, "scoped-rule")
+    if not _has_unsafe_path_syntax(clinerules) and not clinerules.is_symlink() and not _is_symlink_or_junction(clinerules):
+        try:
+            cline_st = clinerules.lstat()
+        except OSError:
+            cline_st = None
+        if cline_st is not None:
+            if stat.S_ISREG(cline_st.st_mode):
+                _add(clinerules, "always-on")
+            elif stat.S_ISDIR(cline_st.st_mode):
+                safe_cline_dir = _resolve_safe_subdir(repo, repo_real, (".clinerules",))
+                if safe_cline_dir is not None:
+                    try:
+                        children = sorted(safe_cline_dir.iterdir(), key=lambda item: item.name)
+                    except OSError:
+                        children = []
+                    for child in children:
+                        if child.suffix in {".md", ".mdc", ".txt"}:
+                            _add(child, "scoped-rule")
 
-    for pattern in RULE_DIR_GLOBS:
-        for match in sorted(repo.glob(pattern)):
+    for dir_segments in RULE_DIRS:
+        rule_dir = _resolve_safe_subdir(repo, repo_real, dir_segments)
+        if rule_dir is None:
+            continue
+        try:
+            entries = sorted(rule_dir.iterdir(), key=lambda item: item.name)
+        except OSError:
+            continue
+        for match in entries:
             if match.suffix in {".md", ".mdc", ".txt"}:
                 _add(match, "scoped-rule")
 
-    for pattern in SKILL_GLOBS:
-        for match in sorted(repo.glob(pattern)):
+    for skill_parent_segments in SKILL_PARENT_DIRS:
+        skills_parent = _resolve_safe_subdir(repo, repo_real, skill_parent_segments)
+        if skills_parent is None:
+            continue
+        try:
+            skill_dirs = sorted(skills_parent.iterdir(), key=lambda item: item.name)
+        except OSError:
+            continue
+        for skill_dir in skill_dirs:
+            if skill_dir.is_symlink() or _is_symlink_or_junction(skill_dir):
+                continue
+            _add(skill_dir / "SKILL.md", "on-demand-skill")
+
+    catalog_dir = _resolve_safe_subdir(repo, repo_real, ("catalog",))
+    if catalog_dir is not None:
+        for match in _walk_named_files(catalog_dir, repo_real, "SKILL.md"):
             _add(match, "on-demand-skill")
 
-    catalog_dir = repo / "catalog"
-    if catalog_dir.is_dir() and not catalog_dir.is_symlink():
-        for match in sorted(catalog_dir.rglob("SKILL.md")):
-            _add(match, "on-demand-skill")
+    subagents_catalog = _resolve_safe_subdir(repo, repo_real, ("catalog", "subagents"))
+    if subagents_catalog is not None:
+        try:
+            sub_dirs = sorted(subagents_catalog.iterdir(), key=lambda item: item.name)
+        except OSError:
+            sub_dirs = []
+        for sub_dir in sub_dirs:
+            if sub_dir.is_symlink() or _is_symlink_or_junction(sub_dir):
+                continue
+            _add(sub_dir / "SUBAGENT.md", "isolated-subagent")
 
-    for pattern in SUBAGENT_GLOBS:
-        for match in sorted(repo.glob(pattern)):
-            _add(match, "isolated-subagent")
+    for dir_segments, required_suffix in SUBAGENT_FLAT_DIRS:
+        agents_dir = _resolve_safe_subdir(repo, repo_real, dir_segments)
+        if agents_dir is None:
+            continue
+        try:
+            agent_files = sorted(agents_dir.iterdir(), key=lambda item: item.name)
+        except OSError:
+            continue
+        for agent_file in agent_files:
+            if agent_file.name.endswith(required_suffix):
+                _add(agent_file, "isolated-subagent")
 
     return discovered
 
@@ -231,13 +461,38 @@ def _classify_effective_tier(default_tier: str, fm: dict[str, str]) -> str:
 def profile_repository(
     repo: Path,
     startup_budget: int = DEFAULT_STARTUP_BUDGET,
+    repo_real: Path | None = None,
 ) -> dict[str, Any]:
+    resolved_repo = repo_real if repo_real is not None else repo.resolve()
+    repo_label = repo.as_posix() or "."
     files_report: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
     split_suggestions: list[dict[str, Any]] = []
 
-    for file_path, raw_tier in _discover_context_files(repo):
+    for file_path, raw_tier in _discover_context_files(repo, resolved_repo):
         rel = file_path.relative_to(repo).as_posix()
+        try:
+            st = file_path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_size > MAX_FILE_BYTES:
+            findings.append(
+                {
+                    "file": rel,
+                    "line": 1,
+                    "rule": "skipped-oversized-file",
+                    "symbol": file_path.name,
+                    "severity": "warning",
+                    "impact": (
+                        f"Context file '{rel}' ({st.st_size} bytes) exceeds the "
+                        f"{MAX_FILE_BYTES}-byte safety limit and was skipped."
+                    ),
+                }
+            )
+            continue
+
         try:
             text = file_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -277,6 +532,7 @@ def profile_repository(
                     "file": rel,
                     "line": 1,
                     "rule": "bloated-context-file",
+                    "symbol": file_path.name,
                     "severity": severity,
                     "impact": (
                         f"Context file '{rel}' ({line_count} lines, {word_count} words, "
@@ -293,6 +549,7 @@ def profile_repository(
                         "file": rel,
                         "line": 1,
                         "rule": "skill-body-over-250-lines",
+                        "symbol": file_path.name,
                         "severity": "warning",
                         "impact": (
                             f"Skill '{rel}' has {line_count} lines (recommended <= {SKILL_RECOMMENDED_LINES}); "
@@ -306,6 +563,7 @@ def profile_repository(
                         "file": rel,
                         "line": 1,
                         "rule": "skill-l1-description-over-budget",
+                        "symbol": file_path.name,
                         "severity": "warning",
                         "impact": (
                             f"Skill '{rel}' frontmatter description consumes ~{desc_tokens} L1 tokens "
@@ -348,6 +606,7 @@ def profile_repository(
                 "file": ".",
                 "line": 1,
                 "rule": "startup-token-budget-exceeded",
+                "symbol": "startup_budget",
                 "severity": "warning",
                 "impact": (
                     f"Estimated startup context load (~{total_startup_tokens} tokens across always-on files "
@@ -369,11 +628,11 @@ def profile_repository(
         "skill": SKILL,
         "script": SCRIPT,
         "status": status,
+        "target": repo_label,
         "summary": summary_text,
-        "repo": repo.as_posix(),
         "findings": findings,
-        "split_suggestions": split_suggestions,
         "data": {
+            "repo": repo_label,
             "files": files_report,
             "findings": findings,
             "split_suggestions": split_suggestions,
@@ -390,6 +649,38 @@ def profile_repository(
             "warnings": warnings,
         },
     }
+
+
+def _emit_invalid_repo(repo_label: str, as_json: bool) -> int:
+    msg = f"Repository directory is missing, invalid, or unsafe: {repo_label}"
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "skill": SKILL,
+                    "script": SCRIPT,
+                    "status": "error",
+                    "target": repo_label,
+                    "summary": msg,
+                    "findings": [],
+                    "data": {
+                        "repo": repo_label,
+                        "files": [],
+                        "findings": [],
+                        "split_suggestions": [],
+                    },
+                    "metrics": {
+                        "files_scanned": 0,
+                        "errors": 1,
+                        "warnings": 0,
+                    },
+                },
+                indent=2,
+            )
+        )
+    else:
+        sys.stderr.write(f"error: {msg}\n")
+    return 2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -417,31 +708,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    repo = Path(args.repo)
-    if not repo.is_dir():
-        msg = f"Repository directory does not exist: {repo.as_posix()}"
-        if args.as_json:
-            print(
-                json.dumps(
-                    {
-                        "skill": SKILL,
-                        "script": SCRIPT,
-                        "status": "error",
-                        "summary": msg,
-                        "repo": repo.as_posix(),
-                        "findings": [],
-                        "split_suggestions": [],
-                        "data": {"files": [], "findings": [], "split_suggestions": []},
-                        "metrics": {"files_scanned": 0, "errors": 1, "warnings": 0},
-                    },
-                    indent=2,
-                )
-            )
-        else:
-            sys.stderr.write(f"error: {msg}\n")
-        return 2
+    raw_arg = args.repo
+    if not raw_arg or not raw_arg.strip() or "\x00" in raw_arg:
+        return _emit_invalid_repo(_sanitize_label(raw_arg), args.as_json)
 
-    payload = profile_repository(repo, startup_budget=args.startup_budget)
+    repo = Path(raw_arg)
+    repo_label = repo.as_posix() or "."
+    if _has_unsafe_path_syntax(repo) or _has_symlink_ancestor(repo):
+        return _emit_invalid_repo(repo_label, args.as_json)
+
+    try:
+        repo_st = repo.lstat()
+    except OSError:
+        return _emit_invalid_repo(repo_label, args.as_json)
+    if not stat.S_ISDIR(repo_st.st_mode):
+        return _emit_invalid_repo(repo_label, args.as_json)
+
+    try:
+        repo_real = repo.resolve()
+    except OSError:
+        return _emit_invalid_repo(repo_label, args.as_json)
+
+    payload = profile_repository(repo, startup_budget=args.startup_budget, repo_real=repo_real)
     if args.as_json:
         print(json.dumps(payload, indent=2))
     else:

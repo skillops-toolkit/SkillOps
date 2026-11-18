@@ -13,12 +13,16 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 SKILL = "fastapi-async-guard"
 SCRIPT = "audit_fastapi_async.py"
+MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_MUTABLE_EXPR_DEPTH = 32
 
 SKIP_DIRS = {
     ".git",
@@ -33,6 +37,20 @@ SKIP_DIRS = {
     ".ruff_cache",
     ".tox",
 }
+
+_NTFS_REPARSE_LINKS = (0xA0000003, 0xA000000C)
+_WINDOWS_DEVICE_STEMS = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{idx}" for idx in range(1, 10)),
+        *(f"LPT{idx}" for idx in range(1, 10)),
+    }
+)
 
 HTTP_ROUTE_METHODS = {
     "get",
@@ -72,6 +90,74 @@ HTTPX_SYNC_ATTRS = {
 URLLIB_BLOCKING_ATTRS = {"urlopen", "urlretrieve"}
 PYDANTIC_MODEL_BASES = {"BaseModel", "SQLModel", "BaseSettings"}
 MUTABLE_BUILTIN_CALLS = {"list", "dict", "set"}
+
+
+def _sanitize_label(raw: str) -> str:
+    cleaned = raw.replace("\x00", "\\x00").strip()
+    return cleaned or "<empty>"
+
+
+def _has_unsafe_path_syntax(path: Path) -> bool:
+    raw = str(path)
+    if "\x00" in raw:
+        return True
+    parts = path.parts[1:] if (path.drive or path.root) else path.parts
+    for part in parts:
+        if ":" in part:
+            return True
+        stem = part.split(".", 1)[0].strip().upper()
+        if stem in _WINDOWS_DEVICE_STEMS:
+            return True
+    return False
+
+
+def _is_symlink_or_junction(path: Path) -> bool:
+    """Return True when path is a symlink or NTFS junction without following it."""
+    try:
+        if path.is_symlink():
+            return True
+    except (OSError, ValueError):
+        return True
+    try:
+        if path.is_junction():
+            return True
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        st = path.lstat()
+    except (OSError, ValueError):
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    try:
+        return st.st_reparse_tag in _NTFS_REPARSE_LINKS
+    except AttributeError:
+        return False
+
+
+def _has_symlink_ancestor(target: Path) -> bool:
+    if _is_symlink_or_junction(target):
+        return True
+    if not target.is_absolute():
+        cur = Path(".")
+        for part in target.parts:
+            if part in ("", "."):
+                continue
+            cur = cur / part
+            if _is_symlink_or_junction(cur):
+                return True
+        return False
+
+    exempt: set[Path] = set()
+    for base_dir in (Path.cwd(), Path(tempfile.gettempdir())):
+        exempt.add(base_dir)
+        exempt.update(base_dir.parents)
+    for parent in target.parents:
+        if parent in exempt:
+            break
+        if _is_symlink_or_junction(parent):
+            return True
+    return False
 
 
 def _finding(
@@ -214,6 +300,7 @@ def _check_blocking_call(
                 "use 'httpx.AsyncClient' with 'await'.",
             )
         if target_mod == "httpx" and attr in HTTPX_SYNC_ATTRS:
+            lower_attr = attr.lower()
             return _finding(
                 rel_file,
                 call.lineno,
@@ -221,7 +308,7 @@ def _check_blocking_call(
                 f"{func.value.id}.{attr}()",
                 "error",
                 f"Synchronous 'httpx.{attr}()' inside 'async def {fn_name}' blocks the event loop; "
-                "use 'async with httpx.AsyncClient() as client: await client.{attr.lower()}(...)'.",
+                f"use 'async with httpx.AsyncClient() as client: await client.{lower_attr}(...)'.",
             )
 
     elif (
@@ -259,8 +346,8 @@ def _is_classvar_annotation(annotation: ast.expr | None) -> bool:
     return False
 
 
-def _is_mutable_expr(expr: ast.expr | None) -> str | None:
-    if expr is None:
+def _is_mutable_expr(expr: ast.expr | None, depth: int = 0) -> str | None:
+    if expr is None or depth > MAX_MUTABLE_EXPR_DEPTH:
         return None
     if isinstance(expr, ast.List):
         return "list"
@@ -280,12 +367,12 @@ def _is_mutable_expr(expr: ast.expr | None) -> str | None:
             if has_factory:
                 return None
             if expr.args:
-                nested = _is_mutable_expr(expr.args[0])
+                nested = _is_mutable_expr(expr.args[0], depth + 1)
                 if nested:
                     return nested
             for kw in expr.keywords:
                 if kw.arg == "default":
-                    nested = _is_mutable_expr(kw.value)
+                    nested = _is_mutable_expr(kw.value, depth + 1)
                     if nested:
                         return nested
     return None
@@ -418,66 +505,164 @@ def audit_python_file(py_path: Path, base_dir: Path) -> list[dict[str, Any]]:
         if py_path != base_dir and base_dir in py_path.parents
         else py_path.name
     )
-    try:
-        source = py_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    if _has_unsafe_path_syntax(py_path) or py_path.is_symlink() or _is_symlink_or_junction(py_path):
         return []
 
     try:
-        tree = ast.parse(source, filename=rel_file)
-    except SyntaxError as exc:
+        st = py_path.lstat()
+    except OSError as exc:
+        safe_msg = str(exc).replace("\x00", "\\x00")
         return [
             _finding(
                 rel_file,
-                exc.lineno or 1,
-                "python-syntax-error",
+                1,
+                "parse-error",
                 py_path.name,
-                "error",
-                f"Python syntax error prevented AST analysis: {exc.msg}.",
+                "warning",
+                f"Failed to stat Python file ({type(exc).__name__}): {safe_msg}.",
             )
         ]
 
-    top_mod_map, top_sym_map = _collect_imports(tree.body)
-    findings: list[dict[str, Any]] = []
+    if not stat.S_ISREG(st.st_mode):
+        return []
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            findings.extend(_audit_pydantic_class(node, rel_file))
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            findings.extend(_audit_route_contract(node, rel_file))
-            if isinstance(node, ast.AsyncFunctionDef):
-                fn_mod_map, fn_sym_map = _collect_imports(
-                    node.body,
-                    top_mod_map,
-                    top_sym_map,
-                )
-                for inner in _iter_async_local_nodes(node.body):
-                    if isinstance(inner, ast.Call):
-                        hit = _check_blocking_call(
-                            inner,
-                            node.name,
-                            rel_file,
-                            fn_mod_map,
-                            fn_sym_map,
-                        )
-                        if hit is not None:
-                            findings.append(hit)
+    if st.st_size > MAX_FILE_BYTES:
+        return [
+            _finding(
+                rel_file,
+                1,
+                "skipped-oversized-file",
+                py_path.name,
+                "warning",
+                f"File '{rel_file}' ({st.st_size} bytes) exceeds the {MAX_FILE_BYTES}-byte limit "
+                "and was skipped.",
+            )
+        ]
+
+    try:
+        source = py_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=rel_file)
+    except (SyntaxError, ValueError, RecursionError, UnicodeDecodeError, OSError) as exc:
+        lineno = exc.lineno if isinstance(exc, SyntaxError) and exc.lineno else 1
+        raw_msg = exc.msg if isinstance(exc, SyntaxError) and exc.msg else str(exc)
+        safe_msg = raw_msg.replace("\x00", "\\x00")
+        return [
+            _finding(
+                rel_file,
+                lineno,
+                "parse-error",
+                py_path.name,
+                "warning",
+                f"Could not parse Python file ({type(exc).__name__}): {safe_msg}.",
+            )
+        ]
+
+    try:
+        top_mod_map, top_sym_map = _collect_imports(tree.body)
+        findings: list[dict[str, Any]] = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                findings.extend(_audit_pydantic_class(node, rel_file))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                findings.extend(_audit_route_contract(node, rel_file))
+                if isinstance(node, ast.AsyncFunctionDef):
+                    fn_mod_map, fn_sym_map = _collect_imports(
+                        node.body,
+                        top_mod_map,
+                        top_sym_map,
+                    )
+                    for inner in _iter_async_local_nodes(node.body):
+                        if isinstance(inner, ast.Call):
+                            hit = _check_blocking_call(
+                                inner,
+                                node.name,
+                                rel_file,
+                                fn_mod_map,
+                                fn_sym_map,
+                            )
+                            if hit is not None:
+                                findings.append(hit)
+    except RecursionError as exc:
+        safe_msg = str(exc).replace("\x00", "\\x00")
+        return [
+            _finding(
+                rel_file,
+                1,
+                "parse-error",
+                py_path.name,
+                "warning",
+                f"AST recursion depth exceeded in '{rel_file}': {safe_msg}.",
+            )
+        ]
 
     findings.sort(key=lambda item: (item["file"], item["line"], item["rule"]))
     return findings
 
 
-def _discover_python_files(target: Path) -> list[Path]:
-    if target.is_file():
-        return [target] if target.suffix == ".py" and not target.is_symlink() else []
+def _discover_python_files(root: Path, root_real: Path) -> list[Path]:
     py_files: list[Path] = []
-    for candidate in sorted(target.rglob("*.py")):
-        rel_parts = candidate.relative_to(target).parts
-        if any(part in SKIP_DIRS for part in rel_parts[:-1]):
+    stack: list[Path] = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = sorted(current.iterdir(), key=lambda item: item.name)
+        except OSError:
             continue
-        if candidate.is_file() and not candidate.is_symlink():
-            py_files.append(candidate)
+        subdirs: list[Path] = []
+        for entry in entries:
+            if _has_unsafe_path_syntax(entry) or entry.is_symlink() or _is_symlink_or_junction(entry):
+                continue
+            try:
+                st = entry.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            try:
+                resolved = entry.resolve()
+            except OSError:
+                continue
+            if not resolved.is_relative_to(root_real):
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                if entry.name in SKIP_DIRS:
+                    continue
+                subdirs.append(entry)
+            elif stat.S_ISREG(st.st_mode) and entry.suffix == ".py":
+                py_files.append(entry)
+        for subdir in reversed(subdirs):
+            stack.append(subdir)
+    py_files.sort(key=lambda item: item.relative_to(root).as_posix())
     return py_files
+
+
+def _emit_invalid_target(target_label: str, as_json: bool) -> int:
+    msg = f"Target path is missing, invalid, or unsafe: {target_label}"
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "skill": SKILL,
+                    "script": SCRIPT,
+                    "status": "error",
+                    "summary": msg,
+                    "target": target_label,
+                    "findings": [],
+                    "data": {"target": target_label, "findings": []},
+                    "metrics": {
+                        "files_scanned": 0,
+                        "findings_count": 0,
+                        "errors": 0,
+                        "warnings": 0,
+                    },
+                },
+                indent=2,
+            )
+        )
+    else:
+        sys.stderr.write(f"error: {msg}\n")
+    return 2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -497,36 +682,39 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    target = Path(args.path)
-    if not target.exists():
-        msg = f"Target path does not exist: {target.as_posix()}"
-        if args.as_json:
-            print(
-                json.dumps(
-                    {
-                        "skill": SKILL,
-                        "script": SCRIPT,
-                        "status": "error",
-                        "summary": msg,
-                        "target": target.as_posix(),
-                        "findings": [],
-                        "data": {"target": target.as_posix(), "findings": []},
-                        "metrics": {
-                            "files_scanned": 0,
-                            "findings_count": 0,
-                            "errors": 0,
-                            "warnings": 0,
-                        },
-                    },
-                    indent=2,
-                )
-            )
-        else:
-            sys.stderr.write(f"error: {msg}\n")
-        return 2
+    raw_arg = args.path
+    if not raw_arg or not raw_arg.strip() or "\x00" in raw_arg:
+        return _emit_invalid_target(_sanitize_label(raw_arg), args.as_json)
 
-    base_dir = target if target.is_dir() else target.parent
-    py_files = _discover_python_files(target)
+    target = Path(raw_arg)
+    target_label = target.as_posix() or "."
+    if _has_unsafe_path_syntax(target) or _has_symlink_ancestor(target):
+        return _emit_invalid_target(target_label, args.as_json)
+
+    try:
+        target_st = target.lstat()
+    except OSError:
+        return _emit_invalid_target(target_label, args.as_json)
+
+    if stat.S_ISREG(target_st.st_mode):
+        try:
+            parent_real = target.parent.resolve()
+            if not target.resolve().is_relative_to(parent_real):
+                return _emit_invalid_target(target_label, args.as_json)
+        except OSError:
+            return _emit_invalid_target(target_label, args.as_json)
+        base_dir = target.parent
+        py_files = [target] if target.suffix == ".py" else []
+    elif stat.S_ISDIR(target_st.st_mode):
+        try:
+            root_real = target.resolve()
+        except OSError:
+            return _emit_invalid_target(target_label, args.as_json)
+        base_dir = target
+        py_files = _discover_python_files(target, root_real)
+    else:
+        return _emit_invalid_target(target_label, args.as_json)
+
     findings: list[dict[str, Any]] = []
     for py_file in py_files:
         findings.extend(audit_python_file(py_file, base_dir))
@@ -543,10 +731,10 @@ def main(argv: list[str] | None = None) -> int:
         "script": SCRIPT,
         "status": status,
         "summary": summary_text,
-        "target": target.as_posix(),
+        "target": target_label,
         "findings": findings,
         "data": {
-            "target": target.as_posix(),
+            "target": target_label,
             "findings": findings,
         },
         "metrics": {
