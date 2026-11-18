@@ -22,10 +22,7 @@ export function renderSkillFilesForRuntime(
 	const baseDir = `${spec.skillsDir}/${name}`;
 	const companionRootDir = options.globalHome ? `~/${baseDir}` : baseDir;
 	const files: PlannedFile[] = [];
-	const globs =
-		parsed.manifest.routing_signals.files_any.length > 0
-			? parsed.manifest.routing_signals.files_any
-			: ["**/*"];
+	const activeGlobs = parsed.manifest.routing_signals.active_file_globs ?? [];
 	const body = rewriteBundledSkillPaths(
 		parsed.markdownBody.trim(),
 		parsed,
@@ -48,11 +45,18 @@ export function renderSkillFilesForRuntime(
 	}
 
 	if (target === "cursor") {
-		const mdcFrontmatter = YAML.stringify({
-			description: parsed.manifest.description,
-			globs,
-			alwaysApply: false,
-		}).trim();
+		const mdcFrontmatter = YAML.stringify(
+			activeGlobs.length > 0
+				? {
+						description: parsed.manifest.description,
+						globs: activeGlobs,
+						alwaysApply: false,
+					}
+				: {
+						description: parsed.manifest.description,
+						alwaysApply: false,
+					},
+		).trim();
 		files.push({
 			target,
 			itemName: name,
@@ -64,10 +68,7 @@ export function renderSkillFilesForRuntime(
 	}
 
 	if (target === "copilot") {
-		const applyTo =
-			parsed.manifest.routing_signals.files_any.length > 0
-				? parsed.manifest.routing_signals.files_any.join(",")
-				: "**";
+		const applyTo = activeGlobs.length > 0 ? activeGlobs.join(",") : "**";
 		const instrFrontmatter = YAML.stringify({
 			applyTo,
 			description: parsed.manifest.description,
@@ -94,11 +95,18 @@ export function renderSkillFilesForRuntime(
 	}
 
 	if (target === "windsurf") {
-		const wsFrontmatter = YAML.stringify({
-			trigger: "model_decision",
-			description: parsed.manifest.description,
-			globs,
-		}).trim();
+		const wsFrontmatter = YAML.stringify(
+			activeGlobs.length > 0
+				? {
+						trigger: "glob",
+						description: parsed.manifest.description,
+						globs: activeGlobs,
+					}
+				: {
+						trigger: "model_decision",
+						description: parsed.manifest.description,
+					},
+		).trim();
 		files.push({
 			target,
 			itemName: name,
@@ -128,11 +136,18 @@ export function renderSkillFilesForRuntime(
 	}
 
 	if (target === "kiro") {
-		const kiroFrontmatter = YAML.stringify({
-			inclusion: "fileMatch",
-			fileMatchPattern: globs[0] ?? "**/*",
-			description: parsed.manifest.description,
-		}).trim();
+		const kiroFrontmatter = YAML.stringify(
+			activeGlobs.length > 0
+				? {
+						inclusion: "fileMatch",
+						fileMatchPattern: activeGlobs.join(","),
+						description: parsed.manifest.description,
+					}
+				: {
+						inclusion: "auto",
+						description: parsed.manifest.description,
+					},
+		).trim();
 		files.push({
 			target,
 			itemName: name,
@@ -164,7 +179,7 @@ export function renderSkillFilesForRuntime(
 		description: parsed.manifest.description,
 		track: parsed.manifest.track,
 		tags: parsed.manifest.tags,
-		globs,
+		...(activeGlobs.length > 0 ? { globs: activeGlobs } : {}),
 		alwaysApply: false,
 	}).trim();
 	files.push({

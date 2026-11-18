@@ -869,6 +869,7 @@ export const RoutingSignalsSchema = z
 	.object({
 		languages: z.array(z.string().max(256)).max(64).default([]),
 		files_any: z.array(z.string().max(256)).max(64).default([]),
+		active_file_globs: z.array(z.string().min(1).max(256)).max(64).default([]),
 		dependencies_any: z.array(z.string().max(256)).max(64).default([]),
 		negative_triggers: z.array(z.string().max(512)).max(64).default([]),
 	})
@@ -969,6 +970,7 @@ export const SkillManifestSchema = z
 		routing_signals: RoutingSignalsSchema.default({
 			languages: [],
 			files_any: [],
+			active_file_globs: [],
 			dependencies_any: [],
 			negative_triggers: [],
 		}),
