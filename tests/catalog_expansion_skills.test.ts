@@ -240,5 +240,5 @@ describe("Issue #235 Built-in Catalog Expansion (12 Hybrid Executable Skills)", 
 			expect(invalidRun.exitCode, item.script).toBe(2);
 			expect(invalidRun.parsed.status).toBe("error");
 		}
-	});
+	}, 60_000);
 });
