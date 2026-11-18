@@ -1,0 +1,22 @@
+{
+  "skill_name": "pytest-fixture-auditor",
+  "runner": "skillops-eval-harness/1.0",
+  "timestamp": "2026-11-18T12:00:00Z",
+  "with_skill": {
+    "pass_rate_mean": 1.0,
+    "pass_rate_stddev": 0.0,
+    "tokens_mean": 980,
+    "latency_ms_mean": 1520
+  },
+  "without_skill": {
+    "pass_rate_mean": 0.5,
+    "pass_rate_stddev": 0.25,
+    "tokens_mean": 2040,
+    "latency_ms_mean": 3600
+  },
+  "delta": {
+    "pass_rate_gain": 0.5,
+    "token_reduction_pct": 51.96,
+    "verdict": "CERTIFIED_IMPROVEMENT"
+  }
+}

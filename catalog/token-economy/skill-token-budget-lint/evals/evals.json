@@ -1,0 +1,42 @@
+{
+  "skill_name": "skill-token-budget-lint",
+  "schema_version": "1.0",
+  "evals": [
+    {
+      "id": "st-01-over-budget-skill",
+      "name": "Flag SKILL.md over 250 lines and wildcard subagent tool permissions",
+      "prompt": "Lint a skill catalog where SKILL.md exceeds 250 lines and a subagent grants '*' tools.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "st-01-tool",
+          "type": "tool_call_contains",
+          "target": "bash",
+          "expected": "lint_skill_budgets.py",
+          "description": "Must invoke lint_skill_budgets.py."
+        },
+        {
+          "id": "st-01-rule",
+          "type": "contains",
+          "target": "output",
+          "expected": "skill-over-250-lines",
+          "description": "Must report skill-over-250-lines violation."
+        }
+      ]
+    },
+    {
+      "id": "st-02-clean-catalog",
+      "name": "Verify SkillOps built-in catalog passes token budget lint",
+      "prompt": "Run the skill budget linter against the built-in SkillOps catalog.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "st-02-clean",
+          "type": "exit_code_zero",
+          "target": "script",
+          "description": "Built-in catalog passes all progressive-disclosure line and L1 token budgets."
+        }
+      ]
+    }
+  ]
+}

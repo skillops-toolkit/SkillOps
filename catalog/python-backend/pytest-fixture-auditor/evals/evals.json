@@ -1,0 +1,42 @@
+{
+  "skill_name": "pytest-fixture-auditor",
+  "schema_version": "1.0",
+  "evals": [
+    {
+      "id": "pf-01-scope-mismatch",
+      "name": "Detect session fixture requesting monkeypatch",
+      "prompt": "Audit a conftest.py file where a session-scoped fixture depends on monkeypatch and runs cleanup without try/finally.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "pf-01-tool",
+          "type": "tool_call_contains",
+          "target": "bash",
+          "expected": "audit_pytest_fixtures.py",
+          "description": "Must invoke audit_pytest_fixtures.py."
+        },
+        {
+          "id": "pf-01-rule",
+          "type": "contains",
+          "target": "output",
+          "expected": "fixture-scope-mismatch",
+          "description": "Must flag session fixture requesting function-scoped monkeypatch."
+        }
+      ]
+    },
+    {
+      "id": "pf-02-clean-suite",
+      "name": "Verify clean try/finally fixture suite exits cleanly",
+      "prompt": "Confirm a clean pytest suite with function-scoped fixtures and try/finally yield cleanup passes.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "pf-02-clean",
+          "type": "exit_code_zero",
+          "target": "script",
+          "description": "Auditor exits 0 when scopes and teardowns are sound."
+        }
+      ]
+    }
+  ]
+}

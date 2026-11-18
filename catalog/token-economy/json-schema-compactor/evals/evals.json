@@ -1,0 +1,42 @@
+{
+  "skill_name": "json-schema-compactor",
+  "schema_version": "1.0",
+  "evals": [
+    {
+      "id": "jsc-01-verbose-description",
+      "name": "Flag verbose parameter description and oversized examples in tool schema",
+      "prompt": "Audit a verbose MCP tool JSON schema for unnecessary prompt token overhead.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "jsc-01-tool",
+          "type": "tool_call_contains",
+          "target": "bash",
+          "expected": "audit_schema_footprint.py",
+          "description": "Must invoke audit_schema_footprint.py."
+        },
+        {
+          "id": "jsc-01-rule",
+          "type": "contains",
+          "target": "output",
+          "expected": "verbose-schema-description",
+          "description": "Must report verbose-schema-description on long property prose."
+        }
+      ]
+    },
+    {
+      "id": "jsc-02-compact-schema",
+      "name": "Pass lean compact schema under token and depth caps",
+      "prompt": "Verify a concise tool JSON schema with brief parameter copy passes.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "jsc-02-clean",
+          "type": "exit_code_zero",
+          "target": "script",
+          "description": "Auditor exits 0 for compact shallow JSON schemas."
+        }
+      ]
+    }
+  ]
+}

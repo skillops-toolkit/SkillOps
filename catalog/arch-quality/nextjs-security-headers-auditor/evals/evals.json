@@ -1,0 +1,42 @@
+{
+  "skill_name": "nextjs-security-headers-auditor",
+  "schema_version": "1.0",
+  "evals": [
+    {
+      "id": "nx-01-public-secret-and-headers",
+      "name": "Flag NEXT_PUBLIC_ secret env vars and missing next.config security headers",
+      "prompt": "Audit a Next.js App Router repository with next.config.ts and NEXT_PUBLIC_API_SECRET.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "nx-01-tool",
+          "type": "tool_call_contains",
+          "target": "bash",
+          "expected": "audit_nextjs_security.py",
+          "description": "Must invoke audit_nextjs_security.py."
+        },
+        {
+          "id": "nx-01-rule",
+          "type": "contains",
+          "target": "output",
+          "expected": "exposed-next-public-secret",
+          "description": "Must flag NEXT_PUBLIC_ secret leak."
+        }
+      ]
+    },
+    {
+      "id": "nx-02-clean-next-config",
+      "name": "Confirm hardened next.config headers pass",
+      "prompt": "Verify a hardened next.config.ts defining X-Content-Type-Options and X-Frame-Options passes.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "nx-02-clean",
+          "type": "exit_code_zero",
+          "target": "script",
+          "description": "Auditor exits 0 when security headers are configured cleanly."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "skill_name": "structured-output-schema-guard",
+  "schema_version": "1.0",
+  "evals": [
+    {
+      "id": "so-01-strict-additional-properties",
+      "name": "Flag missing additionalProperties:false and required key mismatch",
+      "prompt": "Audit tool JSON schemas before wiring them to OpenAI structured outputs.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "so-01-tool",
+          "type": "tool_call_contains",
+          "target": "bash",
+          "expected": "audit_tool_schemas.py",
+          "description": "Must invoke audit_tool_schemas.py."
+        },
+        {
+          "id": "so-01-rule",
+          "type": "contains",
+          "target": "output",
+          "expected": "missing-additional-properties-false",
+          "description": "Must detect missing additionalProperties: false."
+        }
+      ]
+    },
+    {
+      "id": "so-02-clean-strict-schema",
+      "name": "Pass bounded strict object JSON schema",
+      "prompt": "Verify a bounded strict tool input schema passes validation.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "so-02-clean",
+          "type": "exit_code_zero",
+          "target": "script",
+          "description": "Auditor returns exit code 0 for valid strict bounded schema."
+        }
+      ]
+    }
+  ]
+}

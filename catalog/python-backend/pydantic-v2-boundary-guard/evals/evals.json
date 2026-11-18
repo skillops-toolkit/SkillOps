@@ -1,0 +1,42 @@
+{
+  "skill_name": "pydantic-v2-boundary-guard",
+  "schema_version": "1.0",
+  "evals": [
+    {
+      "id": "pv2-01-inner-config",
+      "name": "Detect Pydantic v1 inner class Config and @validator",
+      "prompt": "Audit a Pydantic BaseModel using inner class Config and @validator for v2 migration issues.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "pv2-01-tool",
+          "type": "tool_call_contains",
+          "target": "bash",
+          "expected": "audit_pydantic_models.py",
+          "description": "Must invoke audit_pydantic_models.py."
+        },
+        {
+          "id": "pv2-01-rule",
+          "type": "contains",
+          "target": "output",
+          "expected": "pydantic-v1-inner-config",
+          "description": "Must flag legacy class Config."
+        }
+      ]
+    },
+    {
+      "id": "pv2-02-clean-v2-model",
+      "name": "Confirm ConfigDict strict Pydantic v2 model passes",
+      "prompt": "Verify a Pydantic v2 BaseModel with model_config = ConfigDict(extra='forbid') passes.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "pv2-02-clean",
+          "type": "exit_code_zero",
+          "target": "script",
+          "description": "Auditor exits 0 for clean Pydantic v2 BaseModel."
+        }
+      ]
+    }
+  ]
+}
