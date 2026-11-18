@@ -501,6 +501,7 @@ export function formatSyncReport(
 		activeArtifacts.find(
 			(a) =>
 				a.skill_name !== "codex-agents-index" &&
+				a.skill_name !== "aider-read-config" &&
 				!isSubagentArtifact(a.relative_path),
 		)?.skill_name ?? "mcp-architect";
 	const firstAgent =

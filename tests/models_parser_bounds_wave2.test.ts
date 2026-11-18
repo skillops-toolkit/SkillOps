@@ -764,7 +764,9 @@ describe("ISS-213 Wave 2: Zod v4 Upgrade, Bounded FS/YAML, Cross-Platform Paths 
 			parsedSubagent,
 			"claude",
 		);
-		expect(claudePlanned[0]?.content).toContain("disallowed_tools:");
+		expect(claudePlanned[0]?.content).toContain("disallowedTools:");
+		expect(claudePlanned[0]?.content).toContain("- Bash");
+		expect(claudePlanned[0]?.content).toContain("- Edit");
 		const geminiPlanned = renderSubagentFilesForRuntime(
 			parsedSubagent,
 			"gemini",

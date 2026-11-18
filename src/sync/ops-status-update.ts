@@ -16,6 +16,10 @@ import {
 	type SyncReport,
 	SyncReportSchema,
 } from "../models.js";
+import {
+	collectInstalledAiderConventionPaths,
+	renderAiderReadConfig,
+} from "./aider-config.js";
 import { loadCatalogIndex } from "./catalog-index.js";
 import {
 	collectInstalledCodexCatalogItems,
@@ -488,18 +492,17 @@ export function updateInstalledSkills(
 		}
 	}
 
-	if (
-		(activeTargets.has("codex") || options.targets?.includes("codex")) &&
-		fs.existsSync(path.join(resolvedRepo, "AGENTS.md"))
-	) {
+	if (activeTargets.has("codex") || options.targets?.includes("codex")) {
 		assertAllowedHarnessArtifactPath("codex", "AGENTS.md", "codex-agents-index");
 		const safeAgentsMd = resolveSafeRepoTargetPath(resolvedRepo, "AGENTS.md", canonicalRepo);
-		if (isRegularFileNoFollow(safeAgentsMd)) {
-			const existingAgentsMd = fs.readFileSync(safeAgentsMd, "utf-8");
+		if (!fs.existsSync(safeAgentsMd) || isRegularFileNoFollow(safeAgentsMd)) {
+			const hasAgentsFile = isRegularFileNoFollow(safeAgentsMd);
+			const existingAgentsMd = hasAgentsFile ? fs.readFileSync(safeAgentsMd, "utf-8") : "";
 			const diskAgentsSha = computeSha256(existingAgentsMd);
 			const existingAgentsLock = getLockArtifact(existingLock?.artifacts, "AGENTS.md");
 			activeTargets.add("codex");
 			if (
+				hasAgentsFile &&
 				existingAgentsLock &&
 				diskAgentsSha !== existingAgentsLock.sha256 &&
 				!force
@@ -521,30 +524,87 @@ export function updateInstalledSkills(
 					null,
 					catalogMaps,
 				);
-				const updatedAgentsMd = renderCodexAgentsIndex(
-					existingAgentsMd,
-					codexItems.skills,
-					codexItems.subagents,
-				);
-				const desiredAgentsSha = computeSha256(updatedAgentsMd);
-				if (desiredAgentsSha !== diskAgentsSha) {
-					if (!dryRun) {
-						fs.writeFileSync(safeAgentsMd, updatedAgentsMd, "utf-8");
+				if (hasAgentsFile || codexItems.skills.length > 0 || codexItems.subagents.length > 0) {
+					const updatedAgentsMd = renderCodexAgentsIndex(
+						existingAgentsMd,
+						codexItems.skills,
+						codexItems.subagents,
+					);
+					const desiredAgentsSha = computeSha256(updatedAgentsMd);
+					if (desiredAgentsSha !== diskAgentsSha) {
+						if (!dryRun) {
+							fs.writeFileSync(safeAgentsMd, updatedAgentsMd, "utf-8");
+						}
+						artifacts.push({
+							target: "codex",
+							skill_name: "codex-agents-index",
+							relative_path: "AGENTS.md",
+							sha256: desiredAgentsSha,
+							action: dryRun ? "planned" : hasAgentsFile ? "updated" : "created",
+						});
 					}
-					artifacts.push({
+					newLockArtifacts["AGENTS.md"] = {
 						target: "codex",
 						skill_name: "codex-agents-index",
 						relative_path: "AGENTS.md",
 						sha256: desiredAgentsSha,
-						action: dryRun ? "planned" : "updated",
-					});
+					};
 				}
-				newLockArtifacts["AGENTS.md"] = {
-					target: "codex",
-					skill_name: "codex-agents-index",
-					relative_path: "AGENTS.md",
-					sha256: desiredAgentsSha,
-				};
+			}
+		}
+	}
+
+	if (activeTargets.has("aider") || options.targets?.includes("aider")) {
+		assertAllowedHarnessArtifactPath("aider", ".aider.conf.yml", "aider-read-config");
+		const safeAiderConf = resolveSafeRepoTargetPath(resolvedRepo, ".aider.conf.yml", canonicalRepo);
+		if (!fs.existsSync(safeAiderConf) || isRegularFileNoFollow(safeAiderConf)) {
+			const hasAiderFile = isRegularFileNoFollow(safeAiderConf);
+			const existingAiderConf = hasAiderFile ? fs.readFileSync(safeAiderConf, "utf-8") : "";
+			const diskAiderSha = computeSha256(existingAiderConf);
+			const existingAiderLock = getLockArtifact(existingLock?.artifacts, ".aider.conf.yml");
+			activeTargets.add("aider");
+			if (
+				hasAiderFile &&
+				existingAiderLock &&
+				diskAiderSha !== existingAiderLock.sha256 &&
+				!force
+			) {
+				driftConflicts.push(".aider.conf.yml");
+				artifacts.push({
+					target: "aider",
+					skill_name: "aider-read-config",
+					relative_path: ".aider.conf.yml",
+					sha256: diskAiderSha,
+					action: "conflict",
+				});
+				newLockArtifacts[".aider.conf.yml"] = existingAiderLock;
+			} else {
+				const aiderConventions = collectInstalledAiderConventionPaths(resolvedRepo);
+				if (hasAiderFile || aiderConventions.length > 0) {
+					const updatedAiderConf = renderAiderReadConfig(
+						existingAiderConf,
+						aiderConventions,
+					);
+					const desiredAiderSha = computeSha256(updatedAiderConf);
+					if (desiredAiderSha !== diskAiderSha) {
+						if (!dryRun) {
+							fs.writeFileSync(safeAiderConf, updatedAiderConf, "utf-8");
+						}
+						artifacts.push({
+							target: "aider",
+							skill_name: "aider-read-config",
+							relative_path: ".aider.conf.yml",
+							sha256: desiredAiderSha,
+							action: dryRun ? "planned" : hasAiderFile ? "updated" : "created",
+						});
+					}
+					newLockArtifacts[".aider.conf.yml"] = {
+						target: "aider",
+						skill_name: "aider-read-config",
+						relative_path: ".aider.conf.yml",
+						sha256: desiredAiderSha,
+					};
+				}
 			}
 		}
 	}

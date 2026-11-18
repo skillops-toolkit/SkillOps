@@ -5,6 +5,10 @@
  * 100% backwards-compatible public and internal test exports.
  */
 
+export {
+	renderAiderReadConfig,
+	stripManagedAiderReadEntries,
+} from "./aider-config.js";
 export { type CatalogIndex, loadCatalogIndex } from "./catalog-index.js";
 export {
 	renderCodexAgentsIndex,
@@ -32,7 +36,11 @@ export {
 	updateInstalledSkills,
 } from "./operations.js";
 export { renderSkillFilesForRuntime } from "./renderers/skills.js";
-export { renderSubagentFilesForRuntime } from "./renderers/subagents.js";
+export {
+	encodeTomlBasicString,
+	mapCanonicalToolsToRuntime,
+	renderSubagentFilesForRuntime,
+} from "./renderers/subagents.js";
 export type {
 	AddOptions,
 	ArtifactHealthState,

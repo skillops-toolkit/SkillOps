@@ -25,13 +25,13 @@ export function renderCodexAgentsIndex(
 		"### Active Progressive Disclosure Skills",
 		...skills.map(
 			(s) =>
-				`- **\`${escapeMarkdownHtmlComments(s.manifest.name)}\`** (\`.codex/skills/${escapeMarkdownHtmlComments(s.manifest.name)}/SKILL.md\`): ${escapeMarkdownHtmlComments(s.manifest.description)}`,
+				`- **\`${escapeMarkdownHtmlComments(s.manifest.name)}\`** (\`.agents/skills/${escapeMarkdownHtmlComments(s.manifest.name)}/SKILL.md\`): ${escapeMarkdownHtmlComments(s.manifest.description)}`,
 		),
 		"",
 		"### Active Context-Isolated Subagents",
 		...subagents.map(
 			(sa) =>
-				`- **\`${escapeMarkdownHtmlComments(sa.manifest.name)}\`** (\`.codex/agents/${escapeMarkdownHtmlComments(sa.manifest.name)}.md\`, max output \`${sa.manifest.max_output_tokens}\` tokens): ${escapeMarkdownHtmlComments(sa.manifest.description)}`,
+				`- **\`${escapeMarkdownHtmlComments(sa.manifest.name)}\`** (\`.codex/agents/${escapeMarkdownHtmlComments(sa.manifest.name)}.toml\`, max output \`${sa.manifest.max_output_tokens}\` tokens): ${escapeMarkdownHtmlComments(sa.manifest.description)}`,
 		),
 		CODEX_MARKER_END,
 	];

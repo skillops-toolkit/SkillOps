@@ -17,6 +17,11 @@ import {
 	type SyncReport,
 	SyncReportSchema,
 } from "../models.js";
+import {
+	collectInstalledAiderConventionPaths,
+	renderAiderReadConfig,
+	stripManagedAiderReadEntries,
+} from "./aider-config.js";
 import { loadCatalogIndex } from "./catalog-index.js";
 import {
 	collectInstalledCodexCatalogItems,
@@ -259,6 +264,70 @@ export function removeSkillOrSubagent(
 		}
 	}
 
+	// Update or strip Aider .aider.conf.yml managed read entries when an Aider item is removed
+	if (
+		matchingEntries.some((e) => e.target === "aider") &&
+		driftConflicts.length === 0
+	) {
+		const safeAiderConf = resolveSafeRepoTargetPath(
+			resolvedRepo,
+			".aider.conf.yml",
+			canonicalRepo,
+		);
+		const aiderConfEntry = getLockArtifact(existingLock?.artifacts, ".aider.conf.yml");
+		if (
+			isRegularFileNoFollow(safeAiderConf) &&
+			aiderConfEntry?.skill_name === "aider-read-config"
+		) {
+			const diskText = fs.readFileSync(safeAiderConf, "utf-8");
+			const currentDiskSha = computeSha256(diskText);
+			if (currentDiskSha !== aiderConfEntry.sha256 && !force) {
+				driftConflicts.push(".aider.conf.yml");
+				artifacts.push({
+					target: "aider",
+					skill_name: "aider-read-config",
+					relative_path: ".aider.conf.yml",
+					sha256: currentDiskSha,
+					action: "conflict",
+				});
+			} else {
+				const removedAiderPaths = matchingEntries
+					.filter((e) => e.target === "aider")
+					.map((e) => e.relativePath);
+				const remainingConventions = collectInstalledAiderConventionPaths(
+					resolvedRepo,
+					[],
+					removedAiderPaths,
+				);
+				const hasRemainingAider = remainingConventions.length > 0;
+				const updatedAiderConf = hasRemainingAider
+					? renderAiderReadConfig(diskText, remainingConventions)
+					: stripManagedAiderReadEntries(diskText);
+				const nextAiderSha = computeSha256(updatedAiderConf);
+				if (!dryRun && updatedAiderConf !== diskText) {
+					fs.writeFileSync(safeAiderConf, updatedAiderConf, "utf-8");
+				}
+				if (hasRemainingAider) {
+					newLockArtifacts[".aider.conf.yml"] = {
+						target: "aider",
+						skill_name: "aider-read-config",
+						relative_path: ".aider.conf.yml",
+						sha256: nextAiderSha,
+					};
+				} else {
+					delete newLockArtifacts[".aider.conf.yml"];
+				}
+				artifacts.push({
+					target: "aider",
+					skill_name: "aider-read-config",
+					relative_path: ".aider.conf.yml",
+					sha256: nextAiderSha,
+					action: dryRun ? "planned" : "updated",
+				});
+			}
+		}
+	}
+
 	if (existingLock && !dryRun && driftConflicts.length === 0) {
 		const remainingForSkill = Object.values(newLockArtifacts).some(
 			(e) => e.skill_name === itemName,
@@ -387,6 +456,43 @@ export function cleanSyncedArtifacts(
 					skill_name: codexIndexEntry.skill_name,
 					relative_path: "AGENTS.md",
 					sha256: codexIndexEntry.sha256,
+					action: dryRun ? "planned" : "removed",
+				});
+			}
+		}
+	}
+
+	// Handle Aider .aider.conf.yml read entries if tracked in lockfile
+	const aiderConfEntry = getLockArtifact(existingLock?.artifacts, ".aider.conf.yml");
+	if (aiderConfEntry && aiderConfEntry.skill_name === "aider-read-config") {
+		assertAllowedHarnessArtifactPath("aider", ".aider.conf.yml", "aider-read-config");
+		const fullAiderConf = resolveSafeRepoTargetPath(
+			resolvedRepo,
+			".aider.conf.yml",
+			canonicalRepo,
+		);
+		if (isRegularFileNoFollow(fullAiderConf)) {
+			const diskText = fs.readFileSync(fullAiderConf, "utf-8");
+			const currentDiskSha = computeSha256(diskText);
+			if (currentDiskSha !== aiderConfEntry.sha256 && !force) {
+				driftConflicts.push(".aider.conf.yml");
+				artifacts.push({
+					target: aiderConfEntry.target,
+					skill_name: aiderConfEntry.skill_name,
+					relative_path: ".aider.conf.yml",
+					sha256: currentDiskSha,
+					action: "conflict",
+				});
+			} else {
+				if (!dryRun) {
+					const stripped = stripManagedAiderReadEntries(diskText);
+					fs.writeFileSync(fullAiderConf, stripped, "utf-8");
+				}
+				artifacts.push({
+					target: aiderConfEntry.target,
+					skill_name: aiderConfEntry.skill_name,
+					relative_path: ".aider.conf.yml",
+					sha256: aiderConfEntry.sha256,
 					action: dryRun ? "planned" : "removed",
 				});
 			}

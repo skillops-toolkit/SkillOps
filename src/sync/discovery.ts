@@ -198,7 +198,10 @@ export function discoverInstalledArtifactsOnDisk(
 
 	if (existingLock) {
 		for (const [relPath, entry] of Object.entries(existingLock.artifacts)) {
-			if (entry.skill_name === "codex-agents-index") {
+			if (
+				entry.skill_name === "codex-agents-index" ||
+				entry.skill_name === "aider-read-config"
+			) {
 				continue;
 			}
 			if (!targetSet.has(entry.target)) {

@@ -544,12 +544,15 @@ describe("Track 2 — CLI Audit, Help Invariants, Security & 28-IDE Transpiler S
 			scripts: { "check.py": "print('ok')\n" },
 		});
 
-		// Without AGENTS.md, codex install does NOT create AGENTS.md
+		// Without AGENTS.md, codex install auto-creates AGENTS.md with the managed index
 		const emptyRepo = makeTempDir("skillops-codex-no-agents-");
 		addSkillOrSubagent(emptyRepo, customCatalog, "codex-demo-skill", {
 			targets: ["codex"],
 		});
-		expect(fs.existsSync(path.join(emptyRepo, "AGENTS.md"))).toBe(false);
+		expect(fs.existsSync(path.join(emptyRepo, "AGENTS.md"))).toBe(true);
+		expect(
+			fs.readFileSync(path.join(emptyRepo, "AGENTS.md"), "utf-8"),
+		).toContain("`.agents/skills/codex-demo-skill/SKILL.md`");
 
 		// With existing AGENTS.md, user prose outside markers is preserved and index block is wired
 		const userHeader = "# Project Agent Guide\n\nAlways run unit tests before committing.\n";
@@ -576,10 +579,10 @@ describe("Track 2 — CLI Audit, Help Invariants, Security & 28-IDE Transpiler S
 		);
 		expect(agentsMdAfterAdd).toContain("Always run unit tests before committing.");
 		expect(agentsMdAfterAdd).toContain(
-			"`.codex/skills/codex-demo-skill/SKILL.md`",
+			"`.agents/skills/codex-demo-skill/SKILL.md`",
 		);
 
-		// Also install built-in subagent into codex and verify .codex/agents/<name>.md path
+		// Also install built-in subagent into codex and verify .codex/agents/<name>.toml path
 		addSkillOrSubagent(tmpRepo, BUILTIN_CATALOG_DIR, "context-scout", {
 			targets: ["codex"],
 		});
@@ -588,7 +591,7 @@ describe("Track 2 — CLI Audit, Help Invariants, Security & 28-IDE Transpiler S
 			"utf-8",
 		);
 		expect(agentsMdWithSubagent).toContain(
-			"`.codex/agents/context-scout.md`",
+			"`.codex/agents/context-scout.toml`",
 		);
 
 		// Update skill description in customCatalog and verify updateInstalledSkills refreshes AGENTS.md
