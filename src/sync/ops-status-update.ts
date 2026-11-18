@@ -45,6 +45,7 @@ import { renderSubagentFilesForRuntime } from "./renderers/subagents.js";
 import {
 	type AddOptions,
 	assertCustomCatalogSkillSafe,
+	assertCustomCatalogSubagentSafe,
 	type ArtifactHealthState,
 	type CleanOptions,
 	type InstalledArtifactStatus,
@@ -335,6 +336,7 @@ export function updateInstalledSkills(
 			if (!parsedSubagent) {
 				continue;
 			}
+			assertCustomCatalogSubagentSafe(resolvedCatalog, parsedSubagent);
 			updatedSubagents.add(tuple.itemName);
 			plannedFiles = renderSubagentFilesForRuntime(
 				parsedSubagent,

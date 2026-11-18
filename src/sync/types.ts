@@ -1,8 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ParsedSkillDirectory } from "../auditor/parser.js";
-import { auditSkillSecurity, type SkillSecurityFinding } from "../auditor/security.js";
+import type { ParsedSkillDirectory, ParsedSubagentFile } from "../auditor/parser.js";
+import {
+	auditSkillSecurity,
+	scanMarkdownForPromptInjection,
+	scanTextForTrojanUnicode,
+	type SkillSecurityFinding,
+} from "../auditor/security.js";
 import type { RuntimeTarget } from "../models.js";
 import type { CatalogIndex } from "./catalog-index.js";
 
@@ -149,6 +154,20 @@ function isErrorSecurityFinding(finding: SkillSecurityFinding): boolean {
 	return maybeSeverity === undefined || maybeSeverity === "error";
 }
 
+function formatFindingsError(
+	kind: "skill" | "subagent",
+	name: string,
+	findings: readonly SkillSecurityFinding[],
+): Error {
+	const summary = findings
+		.slice(0, 3)
+		.map((f) => `[${f.rule}] ${f.file}:${f.line} ${f.message}`)
+		.join("; ");
+	return new Error(
+		`Security violation in custom catalog ${kind} '${name}': ${summary}`,
+	);
+}
+
 export function assertCustomCatalogSkillSafe(
 	resolvedCatalog: string,
 	skill: ParsedSkillDirectory,
@@ -159,9 +178,41 @@ export function assertCustomCatalogSkillSafe(
 	const secReport = auditSkillSecurity(skill.skillDir);
 	const errorFindings = secReport.findings.filter(isErrorSecurityFinding);
 	if (errorFindings.length > 0) {
+		throw formatFindingsError("skill", skill.manifest.name, errorFindings);
+	}
+}
+
+export function assertCustomCatalogSubagentSafe(
+	resolvedCatalog: string,
+	subagent: ParsedSubagentFile,
+): void {
+	if (path.resolve(resolvedCatalog) === path.resolve(PACKAGE_CATALOG_DIR)) {
+		return;
+	}
+	const stat = fs.lstatSync(subagent.filePath);
+	if (stat.isSymbolicLink() || !stat.isFile()) {
 		throw new Error(
-			`Security violation in custom catalog skill '${skill.manifest.name}': ${errorFindings[0]!.message}`,
+			`Security violation in custom catalog subagent '${subagent.manifest.name}': subagent file must not be a symlink.`,
 		);
+	}
+	const relFile = path
+		.relative(path.resolve(resolvedCatalog), subagent.filePath)
+		.replace(/\\/g, "/");
+	const rawText = fs.readFileSync(subagent.filePath, "utf-8");
+	const directFindings: SkillSecurityFinding[] = [
+		...scanTextForTrojanUnicode(relFile, rawText, false),
+		...scanMarkdownForPromptInjection(relFile, rawText),
+	];
+	if (
+		path.basename(subagent.filePath) === "SUBAGENT.md" &&
+		path.dirname(subagent.filePath) !== path.join(path.resolve(resolvedCatalog), "subagents")
+	) {
+		const dirReport = auditSkillSecurity(path.dirname(subagent.filePath));
+		directFindings.push(...dirReport.findings);
+	}
+	const errorFindings = directFindings.filter(isErrorSecurityFinding);
+	if (errorFindings.length > 0) {
+		throw formatFindingsError("subagent", subagent.manifest.name, errorFindings);
 	}
 }
 

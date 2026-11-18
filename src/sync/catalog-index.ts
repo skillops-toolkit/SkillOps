@@ -48,7 +48,10 @@ export function getCachedCompanionFiles(
 /**
  * Parse all Skills and Subagents in `catalogDir` once into an immutable lookup index.
  */
-export function loadCatalogIndex(catalogDir: string): CatalogIndex {
+export function loadCatalogIndex(
+	catalogDir: string,
+	options: { strict?: boolean } = {},
+): CatalogIndex {
 	const resolvedCatalog = path.resolve(catalogDir);
 	const skills = new Map<string, ParsedSkillDirectory>();
 	const subagents = new Map<string, ParsedSubagentFile>();
@@ -59,16 +62,22 @@ export function loadCatalogIndex(catalogDir: string): CatalogIndex {
 		try {
 			const parsed = parseSkillDirectory(skillDir, { requireLayout: false });
 			skills.set(parsed.manifest.name, parsed);
-		} catch {
-			// Ignore invalid catalog skill during discovery
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (options.strict || msg.startsWith("Security violation")) {
+				throw err;
+			}
 		}
 	}
 	for (const saPath of discoverSubagentFiles(resolvedCatalog)) {
 		try {
 			const parsed = parseSubagentFile(saPath);
 			subagents.set(parsed.manifest.name, parsed);
-		} catch {
-			// Ignore invalid catalog subagent during discovery
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (options.strict || msg.startsWith("Security violation")) {
+				throw err;
+			}
 		}
 	}
 	return { catalogDir: resolvedCatalog, skills, subagents };

@@ -1,3 +1,5 @@
+import os from "node:os";
+import path from "node:path";
 import type { RuntimeTarget, SyncReport } from "../models.js";
 import { CHARM_PALETTE, fgHex, renderPill } from "../ui/lipgloss.js";
 import {
@@ -11,7 +13,59 @@ import {
 	style,
 } from "../ui/terminal.js";
 import { isGlobalHomePath } from "./fs-safety.js";
-import type { ArtifactHealthState, ProjectStatusReport } from "./types.js";
+import { type ArtifactHealthState, PACKAGE_CATALOG_DIR, type ProjectStatusReport } from "./types.js";
+
+/**
+ * Redact OS user home directories, usernames, and host filesystem roots from
+ * machine/markdown report outputs (`--json`, `-f md`) while preserving relative structure.
+ */
+export function toPortableReportPath(
+	rawPath: string,
+	baseRepoPath?: string,
+): string {
+	const posix = rawPath.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+	const builtinCatalog = PACKAGE_CATALOG_DIR.replace(/\\/g, "/").replace(/\/+$/, "");
+	if (posix === builtinCatalog) {
+		return "catalog";
+	}
+	if (posix.startsWith(`${builtinCatalog}/`)) {
+		return `catalog/${posix.slice(builtinCatalog.length + 1)}`;
+	}
+	if (baseRepoPath) {
+		const normBase = baseRepoPath.replace(/\\/g, "/").replace(/\/+$/, "");
+		if (posix === normBase) {
+			return isGlobalHomePath(baseRepoPath) ? "~" : ".";
+		}
+		if (posix.startsWith(`${normBase}/`)) {
+			const rel = posix.slice(normBase.length + 1);
+			return isGlobalHomePath(baseRepoPath) ? `~/${rel}` : rel;
+		}
+	}
+	const candidates = [
+		os.homedir(),
+		process.env.SKILLOPS_GLOBAL_HOME?.trim() ?? "",
+	]
+		.filter(Boolean)
+		.map((dir) => path.resolve(dir).replace(/\\/g, "/").replace(/\/+$/, ""));
+	for (const home of candidates) {
+		if (posix === home) {
+			return "~";
+		}
+		if (posix.startsWith(`${home}/`)) {
+			return `~/${posix.slice(home.length + 1)}`;
+		}
+	}
+	const redacted = posix
+		.replace(/^[A-Za-z]:\/Users\/[^/]+(?=\/|$)/i, "~")
+		.replace(/^\/(?:Users|home)\/[^/]+(?=\/|$)/, "~");
+	if (redacted !== posix) {
+		return redacted;
+	}
+	if (/^\/(?:tmp|var\/tmp|var\/folders)\//i.test(posix)) {
+		return `<tmp>/${path.posix.basename(posix)}`;
+	}
+	return posix;
+}
 
 function formatHealthPill(
 	state: ArtifactHealthState,
@@ -68,7 +122,13 @@ export function formatProjectStatusReport(
 	const globalBadge = isGlobal ? " [Global: ~]" : "";
 
 	if (format === "json") {
-		return `${JSON.stringify(report, null, 2)}\n`;
+		const sanitizedReport: ProjectStatusReport = {
+			...report,
+			repo_path: toPortableReportPath(report.repo_path, report.repo_path),
+			catalog_path: toPortableReportPath(report.catalog_path, report.repo_path),
+			lockfile_path: toPortableReportPath(report.lockfile_path, report.repo_path),
+		};
+		return `${JSON.stringify(sanitizedReport, null, 2)}\n`;
 	}
 
 	if (format === "markdown") {
@@ -259,7 +319,13 @@ export function formatSyncReport(
 	const isGlobal = isGlobalHomePath(report.repo_path);
 	const globalBadge = isGlobal ? " [Global: ~]" : "";
 	if (format === "json") {
-		return `${JSON.stringify(report, null, 2)}\n`;
+		const sanitizedReport: SyncReport = {
+			...report,
+			repo_path: toPortableReportPath(report.repo_path, report.repo_path),
+			catalog_path: toPortableReportPath(report.catalog_path, report.repo_path),
+			lockfile_path: toPortableReportPath(report.lockfile_path, report.repo_path),
+		};
+		return `${JSON.stringify(sanitizedReport, null, 2)}\n`;
 	}
 	if (format === "markdown") {
 		return [

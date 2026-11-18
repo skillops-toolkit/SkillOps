@@ -47,6 +47,36 @@ export interface ApplyMultiSelectKeyOptions {
 	readonly selectCursorOnEmptySubmit?: boolean;
 }
 
+export class PromptCancelledError extends Error {
+	readonly exitCode = 130;
+	constructor(message = "Interactive prompt interrupted by user (Ctrl+C / SIGINT).") {
+		super(message);
+		this.name = "PromptCancelledError";
+	}
+}
+
+/**
+ * Determine if standard streams support interactive TTY prompts, blocking pseudo-TTYs
+ * inside CI runners (`CI=true`, `GITHUB_ACTIONS=true`) and `TERM=dumb`.
+ */
+export function isInteractiveTty(): boolean {
+	if (!process.stdin.isTTY || !process.stdout.isTTY) {
+		return false;
+	}
+	const ci = process.env.CI?.trim().toLowerCase();
+	if (ci === "true" || ci === "1" || ci === "yes") {
+		return false;
+	}
+	const ghActions = process.env.GITHUB_ACTIONS?.trim().toLowerCase();
+	if (ghActions === "true" || ghActions === "1" || ghActions === "yes") {
+		return false;
+	}
+	if (process.env.TERM?.trim().toLowerCase() === "dumb") {
+		return false;
+	}
+	return true;
+}
+
 export interface RenderMultiSelectOptions {
 	readonly subtitle?: string;
 	readonly targetHint?: string;
@@ -59,6 +89,7 @@ export interface RenderMultiSelectOptions {
 	readonly showSelectAll?: boolean;
 	readonly maxVisible?: number;
 	readonly colorEnabled?: boolean;
+	readonly throwOnInterrupt?: boolean;
 }
 
 function optionMatchesTab(
@@ -707,7 +738,7 @@ export async function runMultiSelectPrompt(
 	options: readonly MultiSelectOption[],
 	renderOpts: RenderMultiSelectOptions = {},
 ): Promise<string[] | null> {
-	if (!process.stdin.isTTY || !process.stdout.isTTY) {
+	if (!isInteractiveTty()) {
 		return null;
 	}
 
@@ -725,7 +756,7 @@ export async function runMultiSelectPrompt(
 		renderedLineCount = frame.split("\n").length;
 	};
 
-	return new Promise<string[] | null>((resolve) => {
+	return new Promise<string[] | null>((resolve, reject) => {
 		const stdin = process.stdin;
 		const wasRaw = stdin.isRaw;
 		if (typeof stdin.setRawMode === "function") {
@@ -759,6 +790,10 @@ export async function runMultiSelectPrompt(
 				process.stdout.write(`\x1b[${renderedLineCount}A\x1b[J`);
 			}
 			cleanup(true);
+			if (renderOpts.throwOnInterrupt) {
+				reject(new PromptCancelledError());
+				return;
+			}
 			resolve(null);
 		};
 
@@ -772,7 +807,11 @@ export async function runMultiSelectPrompt(
 				if (renderedLineCount > 0) {
 					process.stdout.write(`\x1b[${renderedLineCount}A\x1b[J`);
 				}
-				cleanup();
+				cleanup(key === "\x03");
+				if (key === "\x03" && renderOpts.throwOnInterrupt) {
+					reject(new PromptCancelledError());
+					return;
+				}
 				resolve(null);
 				return;
 			}
