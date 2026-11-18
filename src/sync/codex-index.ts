@@ -4,6 +4,15 @@ import { type CatalogIndex, loadCatalogIndex } from "./catalog-index.js";
 import { discoverInstalledArtifactsOnDisk } from "./discovery.js";
 import { CODEX_MARKER_END, CODEX_MARKER_START, PACKAGE_CATALOG_DIR } from "./types.js";
 
+/** Neutralize HTML comment sequences and line breaks inside markdown list item fields. */
+export function escapeMarkdownHtmlComments(text: string): string {
+	return text
+		.replace(/<!--/g, "&lt;!--")
+		.replace(/-->/g, "--&gt;")
+		.replace(/\r?\n+/g, " ")
+		.trim();
+}
+
 export function renderCodexAgentsIndex(
 	existingContent: string | null,
 	skills: readonly ParsedSkillDirectory[],
@@ -16,13 +25,13 @@ export function renderCodexAgentsIndex(
 		"### Active Progressive Disclosure Skills",
 		...skills.map(
 			(s) =>
-				`- **\`${s.manifest.name}\`** (\`.codex/skills/${s.manifest.name}/SKILL.md\`): ${s.manifest.description}`,
+				`- **\`${escapeMarkdownHtmlComments(s.manifest.name)}\`** (\`.codex/skills/${escapeMarkdownHtmlComments(s.manifest.name)}/SKILL.md\`): ${escapeMarkdownHtmlComments(s.manifest.description)}`,
 		),
 		"",
 		"### Active Context-Isolated Subagents",
 		...subagents.map(
 			(sa) =>
-				`- **\`${sa.manifest.name}\`** (\`.codex/agents/${sa.manifest.name}.md\`, max output \`${sa.manifest.max_output_tokens}\` tokens): ${sa.manifest.description}`,
+				`- **\`${escapeMarkdownHtmlComments(sa.manifest.name)}\`** (\`.codex/agents/${escapeMarkdownHtmlComments(sa.manifest.name)}.md\`, max output \`${sa.manifest.max_output_tokens}\` tokens): ${escapeMarkdownHtmlComments(sa.manifest.description)}`,
 		),
 		CODEX_MARKER_END,
 	];
@@ -33,7 +42,13 @@ export function renderCodexAgentsIndex(
 	}
 
 	const startIdx = existingContent.indexOf(CODEX_MARKER_START);
-	const endIdx = existingContent.indexOf(CODEX_MARKER_END);
+	const endIdx =
+		startIdx !== -1
+			? existingContent.indexOf(
+					CODEX_MARKER_END,
+					startIdx + CODEX_MARKER_START.length,
+				)
+			: -1;
 	if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
 		const before = existingContent.slice(0, startIdx).trimEnd();
 		const after = existingContent
@@ -52,6 +67,7 @@ export function collectInstalledCodexCatalogItems(
 	extraSkill?: ParsedSkillDirectory | null,
 	extraSubagent?: ParsedSubagentFile | null,
 	catalogIndex?: CatalogIndex,
+	excludeItemName?: string,
 ): {
 	skills: ParsedSkillDirectory[];
 	subagents: ParsedSubagentFile[];
@@ -69,6 +85,9 @@ export function collectInstalledCodexCatalogItems(
 	const skillByName = new Map<string, ParsedSkillDirectory>();
 	const subagentByName = new Map<string, ParsedSubagentFile>();
 	for (const entry of discoveredCodex) {
+		if (excludeItemName && entry.itemName === excludeItemName) {
+			continue;
+		}
 		if (entry.kind === "skill") {
 			const parsed =
 				catalogMaps.skills.get(entry.itemName) ??
@@ -102,7 +121,13 @@ export function collectInstalledCodexCatalogItems(
 
 export function stripCodexAgentsBlock(existingContent: string): string {
 	const startIdx = existingContent.indexOf(CODEX_MARKER_START);
-	const endIdx = existingContent.indexOf(CODEX_MARKER_END);
+	const endIdx =
+		startIdx !== -1
+			? existingContent.indexOf(
+					CODEX_MARKER_END,
+					startIdx + CODEX_MARKER_START.length,
+				)
+			: -1;
 	if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
 		return existingContent;
 	}
@@ -111,7 +136,7 @@ export function stripCodexAgentsBlock(existingContent: string): string {
 		.slice(endIdx + CODEX_MARKER_END.length)
 		.trimStart();
 	const combined = [before, after].filter(Boolean).join("\n\n").trim();
-	if (!combined || combined === "# AGENTS.md") {
+	if (!combined) {
 		return "";
 	}
 	return `${combined}\n`;

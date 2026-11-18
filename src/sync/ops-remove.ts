@@ -29,14 +29,17 @@ import {
 } from "./discovery.js";
 import {
 	computeSha256,
+	isRegularFileNoFollow,
 	pruneEmptyParentDirs,
 	removeEmptyDirsRecursively,
 	resolveSafeRepoTargetPath,
 } from "./fs-safety.js";
 import {
+	assertAllowedHarnessArtifactPath,
 	createNullProtoArtifactsMap,
 	getLockArtifact,
 	loadExistingLockfile,
+	writeLockfileAtomically,
 } from "./lockfile.js";
 import { renderSkillFilesForRuntime } from "./renderers/skills.js";
 import { renderSubagentFilesForRuntime } from "./renderers/subagents.js";
@@ -75,12 +78,15 @@ export function removeSkillOrSubagent(
 
 	const canonicalRepo = fs.existsSync(resolvedRepo) ? fs.realpathSync(resolvedRepo) : null;
 	const lockfilePath = path.join(resolvedRepo, ".skillops-lock.json");
-	const existingLock = loadExistingLockfile(lockfilePath);
+	const existingLock = loadExistingLockfile(lockfilePath, {
+		allowMalformedRecovery: force,
+	});
 
 	const discovered = discoverInstalledArtifactsOnDisk(
 		resolvedRepo,
 		resolvedCatalog,
 		options.targets,
+		{ allowMalformedRecovery: force },
 	);
 	const matchingMap = new Map<string, DiscoveredInstalledArtifact>();
 	for (const d of discovered) {
@@ -89,32 +95,41 @@ export function removeSkillOrSubagent(
 		}
 	}
 
-	// Fallback check via findExistingItemPathInTarget for custom/unindexed file names matching itemName
-	const candidateTargets: readonly RuntimeTarget[] = options.targets?.length
-		? options.targets
-		: ALL_RUNTIME_TARGETS;
-	for (const target of candidateTargets) {
-		for (const kind of ["skill", "subagent"] as const) {
-			const foundRel = findExistingItemPathInTarget(
-				resolvedRepo,
-				itemName,
-				kind,
-				target,
-			);
-			if (foundRel) {
-				const normalizedRel = foundRel.replace(/\\/g, "/");
-				if (!matchingMap.has(normalizedRel)) {
-					const fullFound = path.join(resolvedRepo, normalizedRel);
-					if (fs.existsSync(fullFound) && fs.statSync(fullFound).isFile()) {
-						const sha256 = computeSha256(fs.readFileSync(fullFound, "utf-8"));
-						matchingMap.set(normalizedRel, {
-							target,
-							itemName,
-							kind,
-							relativePath: normalizedRel,
-							sha256,
-							fromLockfile: false,
-						});
+	// Only use fallback target probing when lockfile is absent (recovery/unindexed known-prefixed items) or --force is passed
+	if (!existingLock || force) {
+		const indexMaps = loadCatalogIndex(resolvedCatalog);
+		const isCatalogOrPrefixed =
+			indexMaps.skills.has(itemName) ||
+			indexMaps.subagents.has(itemName) ||
+			itemName.startsWith("skillops-");
+		if (isCatalogOrPrefixed || force) {
+			const candidateTargets: readonly RuntimeTarget[] = options.targets?.length
+				? options.targets
+				: ALL_RUNTIME_TARGETS;
+			for (const target of candidateTargets) {
+				for (const kind of ["skill", "subagent"] as const) {
+					const foundRel = findExistingItemPathInTarget(
+						resolvedRepo,
+						itemName,
+						kind,
+						target,
+					);
+					if (foundRel) {
+						const normalizedRel = foundRel.replace(/\\/g, "/");
+						if (!matchingMap.has(normalizedRel)) {
+							const fullFound = path.join(resolvedRepo, normalizedRel);
+							if (isRegularFileNoFollow(fullFound)) {
+								const sha256 = computeSha256(fs.readFileSync(fullFound, "utf-8"));
+								matchingMap.set(normalizedRel, {
+									target,
+									itemName,
+									kind,
+									relativePath: normalizedRel,
+									sha256,
+									fromLockfile: false,
+								});
+							}
+						}
 					}
 				}
 			}
@@ -136,13 +151,15 @@ export function removeSkillOrSubagent(
 
 	for (const entry of matchingEntries) {
 		const relPath = entry.relativePath;
+		assertAllowedHarnessArtifactPath(entry.target, relPath, entry.itemName);
 		const fullPath = resolveSafeRepoTargetPath(resolvedRepo, relPath, canonicalRepo);
-		const fileExists =
-			fs.existsSync(fullPath) && fs.statSync(fullPath).isFile();
+		const fileExists = isRegularFileNoFollow(fullPath);
 
 		if (fileExists) {
 			const currentDiskSha = computeSha256(fs.readFileSync(fullPath, "utf-8"));
-			if (entry.fromLockfile && currentDiskSha !== entry.sha256 && !force) {
+			const hasLockDrift = entry.fromLockfile && currentDiskSha !== entry.sha256;
+			const isUntrackedUnderLockfile = !entry.fromLockfile && existingLock !== null;
+			if ((hasLockDrift || isUntrackedUnderLockfile) && !force) {
 				driftConflicts.push(relPath);
 				artifacts.push({
 					target: entry.target,
@@ -177,6 +194,71 @@ export function removeSkillOrSubagent(
 		delete newLockArtifacts[relPath];
 	}
 
+	// Update or strip Codex AGENTS.md managed index when a Codex item is removed
+	if (
+		matchingEntries.some((e) => e.target === "codex") &&
+		driftConflicts.length === 0
+	) {
+		const safeAgentsMd = resolveSafeRepoTargetPath(
+			resolvedRepo,
+			"AGENTS.md",
+			canonicalRepo,
+		);
+		const codexIndexEntry = getLockArtifact(existingLock?.artifacts, "AGENTS.md");
+		if (
+			isRegularFileNoFollow(safeAgentsMd) &&
+			codexIndexEntry?.skill_name === "codex-agents-index"
+		) {
+			const diskText = fs.readFileSync(safeAgentsMd, "utf-8");
+			const currentDiskSha = computeSha256(diskText);
+			if (currentDiskSha !== codexIndexEntry.sha256 && !force) {
+				driftConflicts.push("AGENTS.md");
+				artifacts.push({
+					target: "codex",
+					skill_name: "codex-agents-index",
+					relative_path: "AGENTS.md",
+					sha256: currentDiskSha,
+					action: "conflict",
+				});
+			} else {
+				const remaining = collectInstalledCodexCatalogItems(
+					resolvedRepo,
+					resolvedCatalog,
+					null,
+					null,
+					undefined,
+					itemName,
+				);
+				const hasRemainingCodex =
+					remaining.skills.length > 0 || remaining.subagents.length > 0;
+				const updatedAgents = hasRemainingCodex
+					? renderCodexAgentsIndex(diskText, remaining.skills, remaining.subagents)
+					: stripCodexAgentsBlock(diskText);
+				const nextAgentsSha = computeSha256(updatedAgents);
+				if (!dryRun && updatedAgents !== diskText) {
+					fs.writeFileSync(safeAgentsMd, updatedAgents, "utf-8");
+				}
+				if (hasRemainingCodex) {
+					newLockArtifacts["AGENTS.md"] = {
+						target: "codex",
+						skill_name: "codex-agents-index",
+						relative_path: "AGENTS.md",
+						sha256: nextAgentsSha,
+					};
+				} else {
+					delete newLockArtifacts["AGENTS.md"];
+				}
+				artifacts.push({
+					target: "codex",
+					skill_name: "codex-agents-index",
+					relative_path: "AGENTS.md",
+					sha256: nextAgentsSha,
+					action: dryRun ? "planned" : "updated",
+				});
+			}
+		}
+	}
+
 	if (existingLock && !dryRun && driftConflicts.length === 0) {
 		const remainingForSkill = Object.values(newLockArtifacts).some(
 			(e) => e.skill_name === itemName,
@@ -202,11 +284,7 @@ export function removeSkillOrSubagent(
 			selected_subagents: updatedSubagents,
 			artifacts: newLockArtifacts,
 		});
-		fs.writeFileSync(
-			lockfilePath,
-			`${JSON.stringify(lockData, null, 2)}\n`,
-			"utf-8",
-		);
+		writeLockfileAtomically(lockfilePath, lockData);
 	}
 
 	const affectedTargets = [
@@ -251,10 +329,14 @@ export function cleanSyncedArtifacts(
 
 	const canonicalRepo = fs.existsSync(resolvedRepo) ? fs.realpathSync(resolvedRepo) : null;
 	const lockfilePath = path.join(resolvedRepo, ".skillops-lock.json");
-	const existingLock = loadExistingLockfile(lockfilePath);
+	const existingLock = loadExistingLockfile(lockfilePath, {
+		allowMalformedRecovery: force,
+	});
 	const discovered = discoverInstalledArtifactsOnDisk(
 		resolvedRepo,
 		resolvedCatalog,
+		undefined,
+		{ allowMalformedRecovery: force },
 	);
 
 	if (!existingLock && discovered.length === 0) {
@@ -277,8 +359,13 @@ export function cleanSyncedArtifacts(
 	// Handle codex AGENTS.md block if tracked in lockfile
 	const codexIndexEntry = getLockArtifact(existingLock?.artifacts, "AGENTS.md");
 	if (codexIndexEntry && codexIndexEntry.skill_name === "codex-agents-index") {
-		const fullAgentsMd = resolveSafeRepoTargetPath(resolvedRepo, "AGENTS.md");
-		if (fs.existsSync(fullAgentsMd) && fs.statSync(fullAgentsMd).isFile()) {
+		assertAllowedHarnessArtifactPath("codex", "AGENTS.md", "codex-agents-index");
+		const fullAgentsMd = resolveSafeRepoTargetPath(
+			resolvedRepo,
+			"AGENTS.md",
+			canonicalRepo,
+		);
+		if (isRegularFileNoFollow(fullAgentsMd)) {
 			const diskText = fs.readFileSync(fullAgentsMd, "utf-8");
 			const currentDiskSha = computeSha256(diskText);
 			if (currentDiskSha !== codexIndexEntry.sha256 && !force) {
@@ -293,11 +380,7 @@ export function cleanSyncedArtifacts(
 			} else {
 				if (!dryRun) {
 					const stripped = stripCodexAgentsBlock(diskText);
-					if (stripped) {
-						fs.writeFileSync(fullAgentsMd, stripped, "utf-8");
-					} else {
-						fs.unlinkSync(fullAgentsMd);
-					}
+					fs.writeFileSync(fullAgentsMd, stripped, "utf-8");
 				}
 				artifacts.push({
 					target: codexIndexEntry.target,
@@ -312,14 +395,16 @@ export function cleanSyncedArtifacts(
 
 	for (const entry of discovered) {
 		const relPath = entry.relativePath;
+		assertAllowedHarnessArtifactPath(entry.target, relPath, entry.itemName);
 		const fullPath = resolveSafeRepoTargetPath(resolvedRepo, relPath, canonicalRepo);
-		const fileExists =
-			fs.existsSync(fullPath) && fs.statSync(fullPath).isFile();
+		const fileExists = isRegularFileNoFollow(fullPath);
 
 		if (fileExists) {
 			const diskText = fs.readFileSync(fullPath, "utf-8");
 			const currentDiskSha = computeSha256(diskText);
-			if (entry.fromLockfile && currentDiskSha !== entry.sha256 && !force) {
+			const hasLockDrift = entry.fromLockfile && currentDiskSha !== entry.sha256;
+			const isUntrackedUnderLockfile = !entry.fromLockfile && existingLock !== null;
+			if ((hasLockDrift || isUntrackedUnderLockfile) && !force) {
 				driftConflicts.push(relPath);
 				artifacts.push({
 					target: entry.target,

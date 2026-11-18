@@ -28,14 +28,15 @@ import {
 } from "./discovery.js";
 import {
 	computeSha256,
-	pruneEmptyParentDirs,
-	removeEmptyDirsRecursively,
+	isRegularFileNoFollow,
 	resolveSafeRepoTargetPath,
 } from "./fs-safety.js";
 import {
+	assertAllowedHarnessArtifactPath,
 	createNullProtoArtifactsMap,
 	getLockArtifact,
 	loadExistingLockfile,
+	writeLockfileAtomically,
 } from "./lockfile.js";
 import { renderSkillFilesForRuntime } from "./renderers/skills.js";
 import { renderSubagentFilesForRuntime } from "./renderers/subagents.js";
@@ -71,7 +72,9 @@ function applyPlannedFiles(
 ): SyncReport {
 	const canonicalRepo = fs.existsSync(resolvedRepo) ? fs.realpathSync(resolvedRepo) : null;
 	const lockfilePath = path.join(resolvedRepo, ".skillops-lock.json");
-	const existingLock = loadExistingLockfile(lockfilePath);
+	const existingLock = loadExistingLockfile(lockfilePath, {
+		allowMalformedRecovery: options.force,
+	});
 	const newLockArtifacts: Record<string, SyncLockEntry> =
 		createNullProtoArtifactsMap(
 			options.preserveUnlistedLockEntries
@@ -102,10 +105,10 @@ function applyPlannedFiles(
 	}
 
 	for (const pf of plannedFiles) {
+		assertAllowedHarnessArtifactPath(pf.target, pf.relativePath, pf.itemName);
 		const fullPath = resolveSafeRepoTargetPath(resolvedRepo, pf.relativePath, canonicalRepo);
 		const desiredSha = computeSha256(pf.content);
-		const fileExists =
-			fs.existsSync(fullPath) && fs.statSync(fullPath).isFile();
+		const fileExists = isRegularFileNoFollow(fullPath);
 
 		if (fileExists) {
 			if (!options.force) {
@@ -168,31 +171,48 @@ function applyPlannedFiles(
 	}
 
 	if (options.codexAgentsIndexContent !== undefined) {
-		const safeAgentsMd = resolveSafeRepoTargetPath(resolvedRepo, "AGENTS.md");
-		const diskText =
-			fs.existsSync(safeAgentsMd) && fs.statSync(safeAgentsMd).isFile()
-				? fs.readFileSync(safeAgentsMd, "utf-8")
-				: "";
+		assertAllowedHarnessArtifactPath("codex", "AGENTS.md", "codex-agents-index");
+		const safeAgentsMd = resolveSafeRepoTargetPath(resolvedRepo, "AGENTS.md", canonicalRepo);
+		const hasAgentsFile = isRegularFileNoFollow(safeAgentsMd);
+		const diskText = hasAgentsFile ? fs.readFileSync(safeAgentsMd, "utf-8") : "";
 		const currentDiskSha = computeSha256(diskText);
 		const desiredSha = computeSha256(options.codexAgentsIndexContent);
-		if (desiredSha !== currentDiskSha) {
-			if (!options.dryRun) {
-				fs.writeFileSync(safeAgentsMd, options.codexAgentsIndexContent, "utf-8");
-			}
+		const existingAgentsLock = getLockArtifact(existingLock?.artifacts, "AGENTS.md");
+		if (
+			hasAgentsFile &&
+			existingAgentsLock &&
+			currentDiskSha !== existingAgentsLock.sha256 &&
+			!options.force
+		) {
+			driftConflicts.push("AGENTS.md");
 			artifacts.push({
 				target: "codex",
 				skill_name: "codex-agents-index",
 				relative_path: "AGENTS.md",
-				sha256: desiredSha,
-				action: options.dryRun ? "planned" : "updated",
+				sha256: currentDiskSha,
+				action: "conflict",
 			});
+			newLockArtifacts["AGENTS.md"] = existingAgentsLock;
+		} else {
+			if (desiredSha !== currentDiskSha) {
+				if (!options.dryRun) {
+					fs.writeFileSync(safeAgentsMd, options.codexAgentsIndexContent, "utf-8");
+				}
+				artifacts.push({
+					target: "codex",
+					skill_name: "codex-agents-index",
+					relative_path: "AGENTS.md",
+					sha256: desiredSha,
+					action: options.dryRun ? "planned" : "updated",
+				});
+			}
+			newLockArtifacts["AGENTS.md"] = {
+				target: "codex",
+				skill_name: "codex-agents-index",
+				relative_path: "AGENTS.md",
+				sha256: desiredSha,
+			};
 		}
-		newLockArtifacts["AGENTS.md"] = {
-			target: "codex",
-			skill_name: "codex-agents-index",
-			relative_path: "AGENTS.md",
-			sha256: desiredSha,
-		};
 	}
 
 	const hasWrittenArtifacts = artifacts.some(
@@ -240,11 +260,7 @@ function applyPlannedFiles(
 			total_l1_tokens: existingLock?.total_l1_tokens ?? 0,
 			artifacts: newLockArtifacts,
 		});
-		fs.writeFileSync(
-			lockfilePath,
-			`${JSON.stringify(lockData, null, 2)}\n`,
-			"utf-8",
-		);
+		writeLockfileAtomically(lockfilePath, lockData);
 	}
 
 	return SyncReportSchema.parse({
@@ -318,10 +334,9 @@ export function addSkillOrSubagent(
 			);
 			if (existingRelPath !== null) {
 				const existingFull = path.join(resolvedRepo, existingRelPath);
-				const diskSha =
-					fs.existsSync(existingFull) && fs.statSync(existingFull).isFile()
-						? computeSha256(fs.readFileSync(existingFull, "utf-8"))
-						: computeSha256("");
+				const diskSha = isRegularFileNoFollow(existingFull)
+					? computeSha256(fs.readFileSync(existingFull, "utf-8"))
+					: computeSha256("");
 				skippedTargetItems.push({
 					target,
 					itemName,
@@ -340,8 +355,9 @@ export function addSkillOrSubagent(
 		targets.includes("codex") &&
 		fs.existsSync(path.join(resolvedRepo, "AGENTS.md"))
 	) {
-		const safeAgentsMd = resolveSafeRepoTargetPath(resolvedRepo, "AGENTS.md");
-		if (fs.statSync(safeAgentsMd).isFile()) {
+		const canonicalRepo = fs.existsSync(resolvedRepo) ? fs.realpathSync(resolvedRepo) : null;
+		const safeAgentsMd = resolveSafeRepoTargetPath(resolvedRepo, "AGENTS.md", canonicalRepo);
+		if (isRegularFileNoFollow(safeAgentsMd)) {
 			const existingAgentsMd = fs.readFileSync(safeAgentsMd, "utf-8");
 			const codexItems = collectInstalledCodexCatalogItems(
 				resolvedRepo,
