@@ -6,108 +6,30 @@
  * ANSI-aware horizontal block composition (`joinHorizontal`).
  */
 
-import { isColorEnabled, padVisible, visibleLength } from "./terminal.js";
+import {
+	bgHex,
+	CHARM_PALETTE,
+	type CharmColorKey,
+	fgHex,
+	hexToRgb,
+	isColorEnabled,
+	padVisible,
+	type PillOptions,
+	renderPill,
+	visibleLength,
+} from "./palette.js";
+
+export {
+	bgHex,
+	CHARM_PALETTE,
+	type CharmColorKey,
+	fgHex,
+	hexToRgb,
+	type PillOptions,
+	renderPill,
+};
 
 const ESC = String.fromCharCode(27);
-
-/**
- * SkillOps Soot, Chalk & Electric Lime TrueColor palette (aligned with SkillOps-Web).
- */
-export const CHARM_PALETTE = {
-	indigo: "#DAFA9C",
-	fuchsia: "#DAFA9C",
-	hotPink: "#DAFA9C",
-	mint: "#DAFA9C",
-	amber: "#E5C07B",
-	coral: "#FF5F56",
-	cyan: "#FFFFFF",
-	lavender: "#A8A8A8",
-	white: "#FFFFFF",
-	muted: "#6C6C6C",
-	subtle: "#454545",
-	surface: "#1A1A1A",
-	keycapBg: "#242424",
-	inkDark: "#0F0F0F",
-} as const;
-
-export type CharmColorKey = keyof typeof CHARM_PALETTE;
-
-/**
- * Parse a `#RRGGBB` or `#RGB` hex color string into an `[r, g, b]` tuple.
- */
-export function hexToRgb(hex: string): readonly [number, number, number] {
-	const cleaned = hex.trim().replace(/^#/, "");
-	if (cleaned.length === 3) {
-		const r = Number.parseInt(`${cleaned[0]}${cleaned[0]}`, 16);
-		const g = Number.parseInt(`${cleaned[1]}${cleaned[1]}`, 16);
-		const b = Number.parseInt(`${cleaned[2]}${cleaned[2]}`, 16);
-		return [
-			Number.isNaN(r) ? 255 : r,
-			Number.isNaN(g) ? 255 : g,
-			Number.isNaN(b) ? 255 : b,
-		];
-	}
-	const r = Number.parseInt(cleaned.slice(0, 2), 16);
-	const g = Number.parseInt(cleaned.slice(2, 4), 16);
-	const b = Number.parseInt(cleaned.slice(4, 6), 16);
-	return [
-		Number.isNaN(r) ? 255 : r,
-		Number.isNaN(g) ? 255 : g,
-		Number.isNaN(b) ? 255 : b,
-	];
-}
-
-/**
- * Apply 24-bit TrueColor foreground (`\x1b[38;2;R;G;Bm`) when color is enabled.
- */
-export function fgHex(hex: string, text: string, enabled?: boolean): string {
-	const useColor = enabled ?? isColorEnabled();
-	if (!useColor || text.length === 0) {
-		return text;
-	}
-	const [r, g, b] = hexToRgb(hex);
-	return `${ESC}[38;2;${r};${g};${b}m${text}${ESC}[39m`;
-}
-
-/**
- * Apply 24-bit TrueColor background (`\x1b[48;2;R;G;Bm`) when color is enabled.
- */
-export function bgHex(hex: string, text: string, enabled?: boolean): string {
-	const useColor = enabled ?? isColorEnabled();
-	if (!useColor || text.length === 0) {
-		return text;
-	}
-	const [r, g, b] = hexToRgb(hex);
-	return `${ESC}[48;2;${r};${g};${b}m${text}${ESC}[49m`;
-}
-
-export interface PillOptions {
-	readonly fg?: string;
-	readonly bg?: string;
-	readonly bold?: boolean;
-	readonly colorEnabled?: boolean;
-}
-
-/**
- * Render a Lip Gloss background pill badge without altering visible character length.
- */
-export function renderPill(text: string, options?: PillOptions): string {
-	const useColor = options?.colorEnabled ?? isColorEnabled();
-	if (!useColor || text.length === 0) {
-		return text;
-	}
-	const bg = options?.bg ?? CHARM_PALETTE.indigo;
-	const isLimeBg = bg.toUpperCase() === CHARM_PALETTE.indigo;
-	const fg =
-		options?.fg ?? (isLimeBg ? CHARM_PALETTE.inkDark : CHARM_PALETTE.white);
-	const bold = options?.bold ?? true;
-	let styled = fgHex(fg, text, true);
-	styled = bgHex(bg, styled, true);
-	if (bold) {
-		styled = `${ESC}[1m${styled}${ESC}[22m`;
-	}
-	return styled;
-}
 
 /**
  * Render a Charm `bubbles/help` style keybinding hint (`key action`).

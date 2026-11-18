@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * SkillOps NPX CLI Entrypoint (`npx skillops-cli@latest <add|remove>`).
  */
@@ -40,6 +41,7 @@ import {
 	formatProjectStatusReport,
 	formatSyncReport,
 	inspectProjectStatus,
+	loadCatalogIndex,
 	removeSkillOrSubagent,
 	updateInstalledSkills,
 } from "./sync/index.js";
@@ -722,11 +724,13 @@ export function runCli(argv: readonly string[]): number {
 		}
 
 		try {
+			const catalogIndex = loadCatalogIndex(catalogDir);
 			const reports = itemsToAdd.map((itemName) =>
 				addSkillOrSubagent(repoPath, catalogDir, itemName, {
 					targets,
 					dryRun,
 					force,
+					catalogIndex,
 				}),
 			);
 			const firstReport = reports[0];
@@ -802,11 +806,13 @@ export function runCli(argv: readonly string[]): number {
 				return ExitCode.ERROR;
 			}
 
+			const catalogIndex = loadCatalogIndex(catalogDir);
 			const reports = itemsToRemove.map((itemName) =>
 				removeSkillOrSubagent(repoPath, catalogDir, itemName, {
 					targets,
 					dryRun,
 					force,
+					catalogIndex,
 				}),
 			);
 			const firstReport = reports[0];
