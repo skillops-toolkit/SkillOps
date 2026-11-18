@@ -37,6 +37,7 @@ export interface ParsedSkillDirectory {
 	readonly extraScripts: string[];
 	readonly referenceFiles: string[];
 	readonly allFiles: string[];
+	readonly bundleableFiles: string[];
 	readonly evalsPath: string | null;
 	readonly benchmarkPath?: string | null;
 	readonly evalSuite?: EvalSuite;
@@ -144,6 +145,13 @@ const IGNORED_SKILL_DIRS = new Set([
 	".ruff_cache",
 	".mypy_cache",
 ]);
+
+const BUNDLEABLE_PREFIXES = ["scripts/", "references/", "assets/"] as const;
+
+export function isBundleableSkillFile(relPath: string): boolean {
+	const posix = relPath.replace(/\\/g, "/");
+	return BUNDLEABLE_PREFIXES.some((prefix) => posix.startsWith(prefix));
+}
 
 const IGNORED_SKILL_FILES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
 
@@ -495,6 +503,7 @@ export function parseSkillDirectory(
 	}
 
 	const allFiles = walkAllSkillFiles(skillDir);
+	const bundleableFiles = allFiles.filter(isBundleableSkillFile);
 
 	return {
 		skillDir,
@@ -508,6 +517,7 @@ export function parseSkillDirectory(
 		extraScripts: extraScripts.sort(),
 		referenceFiles: referenceFiles.sort(),
 		allFiles,
+		bundleableFiles,
 		evalsPath,
 		benchmarkPath,
 		...(evalSuite ? { evalSuite } : {}),

@@ -28,6 +28,7 @@ import {
 } from "./discovery.js";
 import {
 	computeSha256,
+	isGlobalHomePath,
 	isRegularFileNoFollow,
 	resolveSafeRepoTargetPath,
 } from "./fs-safety.js";
@@ -322,9 +323,10 @@ export function addSkillOrSubagent(
 	const skippedTargetItems: SkippedTargetItem[] = [];
 	const itemKind: "skill" | "subagent" = matchedSkill ? "skill" : "subagent";
 
+	const globalHome = isGlobalHomePath(resolvedRepo);
 	for (const target of targets) {
 		const targetPlanned = matchedSkill
-			? renderSkillFilesForRuntime(matchedSkill, target)
+			? renderSkillFilesForRuntime(matchedSkill, target, { globalHome })
 			: renderSubagentFilesForRuntime(matchedSubagent!, target);
 
 		if (!force) {

@@ -28,6 +28,7 @@ import {
 } from "./discovery.js";
 import {
 	computeSha256,
+	isGlobalHomePath,
 	isRegularFileNoFollow,
 	pruneEmptyParentDirs,
 	removeEmptyDirsRecursively,
@@ -83,6 +84,7 @@ export function inspectProjectStatus(
 			? options.catalogIndex
 			: loadCatalogIndex(resolvedCatalog);
 
+	const globalHome = isGlobalHomePath(resolvedRepo);
 	const plannedShaCache = new Map<string, Map<string, string>>();
 	const getCatalogShaForFile = (
 		itemName: string,
@@ -97,7 +99,9 @@ export function inspectProjectStatus(
 			if (kind === "skill") {
 				const parsedSkill = catalogMaps.skills.get(itemName);
 				if (parsedSkill) {
-					for (const pf of renderSkillFilesForRuntime(parsedSkill, target)) {
+					for (const pf of renderSkillFilesForRuntime(parsedSkill, target, {
+						globalHome,
+					})) {
 						fileMap.set(
 							pf.relativePath.replace(/\\/g, "/"),
 							computeSha256(pf.content),
@@ -330,7 +334,9 @@ export function updateInstalledSkills(
 			}
 			assertCustomCatalogSkillSafe(resolvedCatalog, parsedSkill);
 			updatedSkills.add(tuple.itemName);
-			plannedFiles = renderSkillFilesForRuntime(parsedSkill, tuple.target);
+			plannedFiles = renderSkillFilesForRuntime(parsedSkill, tuple.target, {
+				globalHome: isGlobalHomePath(resolvedRepo),
+			});
 		} else {
 			const parsedSubagent = catalogMaps.subagents.get(tuple.itemName);
 			if (!parsedSubagent) {

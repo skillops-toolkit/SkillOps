@@ -31,7 +31,7 @@ export function getCachedCompanionFiles(
 		return existing;
 	}
 	const files = new Map<string, string>();
-	for (const relFile of parsed.allFiles) {
+	for (const relFile of parsed.bundleableFiles) {
 		if (relFile === "SKILL.md") {
 			continue;
 		}
