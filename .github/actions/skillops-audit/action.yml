@@ -1,5 +1,5 @@
 name: "SkillOps Multi-Runtime Catalog Verification Gate"
-description: "Verifies that all catalog Skills (SKILL.md) and Subagents (SUBAGENT.md) transpile cleanly across all 28 supported AI coding IDEs and CLIs."
+description: "Verifies that all catalog Skills (SKILL.md) and Subagents (SUBAGENT.md) pass strict security and layout auditing and transpile cleanly across all 28 supported AI coding IDEs and CLIs."
 author: "OdevMatheus"
 branding:
   icon: "shield"
@@ -27,15 +27,18 @@ runs:
       with:
         node-version: ${{ inputs.node-version }}
 
-    - name: Verify Multi-Runtime Transpilation (Dry-Run)
+    - name: Audit Catalog Security & Verify Multi-Runtime Transpilation
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         INPUT_CATALOG_PATH: ${{ inputs.catalog-path }}
         INPUT_TARGETS: ${{ inputs.targets }}
       run: |
         set -euo pipefail
-        if [[ -f "./dist/cli.js" ]]; then
-          node ./dist/cli.js add --all --catalog "$INPUT_CATALOG_PATH" --targets "$INPUT_TARGETS" --dry-run
+        if [[ -f "${ACTION_PATH}/dist/cli.js" ]]; then
+          cli_cmd=(node "${ACTION_PATH}/dist/cli.js")
         else
-          npx --yes skillops-cli add --all --catalog "$INPUT_CATALOG_PATH" --targets "$INPUT_TARGETS" --dry-run
+          cli_cmd=(npx --yes skillops-cli@1.5.2)
         fi
+        "${cli_cmd[@]}" audit --catalog "$INPUT_CATALOG_PATH" --strict
+        "${cli_cmd[@]}" add --all --catalog "$INPUT_CATALOG_PATH" --targets "$INPUT_TARGETS" --dry-run
