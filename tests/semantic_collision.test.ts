@@ -1,8 +1,8 @@
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { runCli } from "../src/cli.js";
 import {
 	DEFAULT_SEMANTIC_COLLISION_THRESHOLD,
 	detectSemanticCollisions,
@@ -59,7 +59,7 @@ function createValidSkill(
 	const skillMd = [
 		"---",
 		`name: ${name}`,
-		`description: "${description.replace(/"/g, '\\"')}"`,
+		`description: ${JSON.stringify(description)}`,
 		`track: ${track}`,
 		"version: 1.0.0",
 		"tags:",
@@ -198,20 +198,32 @@ describe("Issue #221 Semantic Collision Auditor, Token Telemetry & Progressive A
 		expect(report.collisions).toHaveLength(1);
 		expect(report.collisions[0]?.similarity).toBeGreaterThanOrEqual(0.65);
 
-		const cliRes = spawnSync(
-			process.execPath,
-			[
-				path.resolve("dist/cli.js"),
+		let capturedStdout = "";
+		const outSpy = vi
+			.spyOn(process.stdout, "write")
+			.mockImplementation((chunk: string | Uint8Array) => {
+				capturedStdout +=
+					typeof chunk === "string"
+						? chunk
+						: Buffer.from(chunk).toString("utf-8");
+				return true;
+			});
+		let cliStatus: number;
+		try {
+			cliStatus = runCli([
+				"node",
+				"skillops",
 				"audit",
 				"--strict",
 				"--catalog",
 				tmpCatalog,
 				"--json",
-			],
-			{ encoding: "utf-8" },
-		);
-		expect(cliRes.status).toBe(ExitCode.COLLISION_ERROR);
-		const parsedOut = JSON.parse(cliRes.stdout) as {
+			]);
+		} finally {
+			outSpy.mockRestore();
+		}
+		expect(cliStatus).toBe(ExitCode.COLLISION_ERROR);
+		const parsedOut = JSON.parse(capturedStdout) as {
 			passed: boolean;
 			collision_pairs: Array<{ item_a: string; item_b: string }>;
 		};
