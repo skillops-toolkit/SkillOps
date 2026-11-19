@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.6.0] - 2026-11-19
+
+### Added
+- **Expanded Catalog — 12 Hybrid Executable Skills (`#235`, `#244`):** Added 8 new pure-stdlib Python companion skills (3 per track across `ai-engineering`, `python-backend`, `arch-quality`, and `token-economy`), complete with `evals/evals.json`, `evals/benchmark.json`, bounded reads, symlink/junction protections, and `ScriptOutputSchema` JSON output:
+  - `ai-engineering`: `prompt-injection-guard`, `structured-output-schema-guard`
+  - `python-backend`: `pytest-fixture-auditor`, `pydantic-v2-boundary-guard`
+  - `arch-quality`: `sql-migration-safety-guard`, `nextjs-security-headers-auditor`
+  - `token-economy`: `skill-token-budget-lint`, `json-schema-compactor`
+- **Expanded Catalog — 6 Context-Isolated Subagents (`#236`, `#245`):** Added 4 new read-only `INV-SKILL-04` subagents (`test-failure-triager`, `dependency-supply-chain-auditor`, `api-contract-verifier`, `dead-code-and-bloat-scout`) alongside `context-scout` and `security-diff-reviewer`.
+- **Vendor-Spec Transpilers & Aider/Zed Alignment (`#220`, `#243`):** Aligned Claude Code subagents to PascalCase `tools` + `disallowedTools`, Copilot `.agent.md` native tools, Codex `.codex/agents/<name>.toml` + `.agents/skills/` + auto-managed `AGENTS.md`, spec-compliant TOML escaping (`\u007F` and `\UXXXXXXXX`), `.aider.conf.yml` `read:` sync/strip with SHA-256 drift checks, Zed `.agents/skills` progressive directories, and `## Tool & Sandbox Constraints` across all 28 harnesses.
+- **Semantic Active-File Routing Signals (`#219`, `#242`):** Added `routing_signals.active_file_globs` to decouple IDE activation globs from repository detection signals (`files_any`).
+- **Modularized Security & Sync Subsystems (`#215`, `#234`, `#237`, `#238`):** Decomposed `src/auditor/security.ts` by language/domain (`src/auditor/security/*`) and split the sync engine into modular files (`src/sync/*`), adding catalog caching and removing UI circular dependencies.
+
+### Security & Fixes
+- **CI Audit Alignment (`#246`):** Aligned `.github/workflows/ai-ci.yml` `getattr()` reflection checks with `src/auditor/security/python.ts` to eliminate false positives on safe static AST reads while blocking unsafe reflection.
+- **Lockfile, CLI Trust & Companion Bundling (`#216`, `#217`, `#218`, `#239`, `#240`, `#241`):** Enforced explicit `--catalog` trust boundaries, typo-aware CLI flag validation, `.skillops.yml` budgets, path redaction, exclusion of `evals/**` from runtime bundles, `~/` `--global` companion path rewriting, and CRLF/LF frontmatter preservation.
+
+---
+
 ## [1.5.2] - 2026-11-11
 
 ### Fixed

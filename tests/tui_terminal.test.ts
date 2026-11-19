@@ -466,7 +466,7 @@ describe("Zero-Dependency ANSI TUI Aesthetic Engine", () => {
 			true,
 		);
 		expect(stripAnsi(syncReportOut)).toContain(
-			"◆ SkillOps v1.5.2 — Skills & Subagents Installed",
+			"◆ SkillOps v1.6.0 — Skills & Subagents Installed",
 		);
 		expect(stripAnsi(syncReportOut)).toContain("+ CREATED");
 		expect(stripAnsi(syncReportOut)).toContain("(cursor)");

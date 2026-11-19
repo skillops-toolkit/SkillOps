@@ -22,7 +22,7 @@ export {
 	readBoundedUtf8File,
 } from "./io/bounded-fs.js";
 
-export const SKILLOPS_VERSION = "1.5.2";
+export const SKILLOPS_VERSION = "1.6.0";
 export const MAX_LOCKFILE_ARTIFACTS = 4096;
 
 const MAX_RAW_MANIFEST_BYTES = 256 * 1024;

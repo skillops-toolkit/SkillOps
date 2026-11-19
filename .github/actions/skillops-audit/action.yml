@@ -38,7 +38,7 @@ runs:
         if [[ -f "${ACTION_PATH}/dist/cli.js" ]]; then
           cli_cmd=(node "${ACTION_PATH}/dist/cli.js")
         else
-          cli_cmd=(npx --yes skillops-cli@1.5.2)
+          cli_cmd=(npx --yes skillops-cli@1.6.0)
         fi
         "${cli_cmd[@]}" audit --catalog "$INPUT_CATALOG_PATH" --strict
         "${cli_cmd[@]}" add --all --catalog "$INPUT_CATALOG_PATH" --targets "$INPUT_TARGETS" --dry-run
