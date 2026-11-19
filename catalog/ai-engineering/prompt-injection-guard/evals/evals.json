@@ -1,0 +1,42 @@
+{
+  "skill_name": "prompt-injection-guard",
+  "schema_version": "1.0",
+  "evals": [
+    {
+      "id": "pi-01-system-prompt-interpolation",
+      "name": "Detect untrusted user input interpolated into system prompt",
+      "prompt": "Audit a Python service that formats user_input into a system prompt before calling OpenAI.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "pi-01-tool",
+          "type": "tool_call_contains",
+          "target": "bash",
+          "expected": "audit_prompt_boundaries.py",
+          "description": "Must invoke the deterministic prompt boundary auditor script."
+        },
+        {
+          "id": "pi-01-rule",
+          "type": "contains",
+          "target": "output",
+          "expected": "untrusted-input-in-system-prompt",
+          "description": "Must report untrusted-input-in-system-prompt."
+        }
+      ]
+    },
+    {
+      "id": "pi-02-clean-role-separation",
+      "name": "Verify clean static system prompt with user turn payload passes",
+      "prompt": "Verify a TypeScript handler that sends static system instructions and isolates user queries in role: 'user'.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "pi-02-clean",
+          "type": "exit_code_zero",
+          "target": "script",
+          "description": "Auditor exits 0 when system instructions are static and LLM outputs are schema-validated."
+        }
+      ]
+    }
+  ]
+}

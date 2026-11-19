@@ -1,0 +1,22 @@
+{
+  "skill_name": "sql-migration-safety-guard",
+  "runner": "skillops-eval-harness/1.0",
+  "timestamp": "2026-11-18T12:00:00Z",
+  "with_skill": {
+    "pass_rate_mean": 1.0,
+    "pass_rate_stddev": 0.0,
+    "tokens_mean": 890,
+    "latency_ms_mean": 1410
+  },
+  "without_skill": {
+    "pass_rate_mean": 0.5,
+    "pass_rate_stddev": 0.25,
+    "tokens_mean": 1880,
+    "latency_ms_mean": 3350
+  },
+  "delta": {
+    "pass_rate_gain": 0.5,
+    "token_reduction_pct": 52.66,
+    "verdict": "CERTIFIED_IMPROVEMENT"
+  }
+}

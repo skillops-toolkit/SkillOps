@@ -1,0 +1,42 @@
+{
+  "skill_name": "sql-migration-safety-guard",
+  "schema_version": "1.0",
+  "evals": [
+    {
+      "id": "sql-01-unsafe-index-and-not-null",
+      "name": "Flag non-concurrent CREATE INDEX and NOT NULL ADD COLUMN without DEFAULT",
+      "prompt": "Audit a SQL migration before production deployment.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "sql-01-tool",
+          "type": "tool_call_contains",
+          "target": "bash",
+          "expected": "audit_sql_migrations.py",
+          "description": "Must invoke audit_sql_migrations.py."
+        },
+        {
+          "id": "sql-01-rule",
+          "type": "contains",
+          "target": "output",
+          "expected": "not-null-column-without-default",
+          "description": "Must flag NOT NULL column addition missing DEFAULT."
+        }
+      ]
+    },
+    {
+      "id": "sql-02-clean-concurrent-migration",
+      "name": "Pass concurrent index creation",
+      "prompt": "Verify a CREATE INDEX CONCURRENTLY migration passes audit.",
+      "fixtures": [],
+      "assertions": [
+        {
+          "id": "sql-02-clean",
+          "type": "exit_code_zero",
+          "target": "script",
+          "description": "Auditor exits 0 for CREATE INDEX CONCURRENTLY."
+        }
+      ]
+    }
+  ]
+}

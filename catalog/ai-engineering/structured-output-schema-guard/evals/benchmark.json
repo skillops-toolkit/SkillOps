@@ -1,0 +1,22 @@
+{
+  "skill_name": "structured-output-schema-guard",
+  "runner": "skillops-eval-harness/1.0",
+  "timestamp": "2026-11-18T12:00:00Z",
+  "with_skill": {
+    "pass_rate_mean": 1.0,
+    "pass_rate_stddev": 0.0,
+    "tokens_mean": 940,
+    "latency_ms_mean": 1480
+  },
+  "without_skill": {
+    "pass_rate_mean": 0.5,
+    "pass_rate_stddev": 0.25,
+    "tokens_mean": 1920,
+    "latency_ms_mean": 3450
+  },
+  "delta": {
+    "pass_rate_gain": 0.5,
+    "token_reduction_pct": 51.04,
+    "verdict": "CERTIFIED_IMPROVEMENT"
+  }
+}
