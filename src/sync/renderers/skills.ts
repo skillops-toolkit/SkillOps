@@ -8,13 +8,19 @@ import {
 	rewriteProgressiveSkillRawText,
 } from "./companion-paths.js";
 
+export interface RenderSkillOptions {
+	readonly globalHome?: boolean;
+}
+
 export function renderSkillFilesForRuntime(
 	parsed: ParsedSkillDirectory,
 	target: RuntimeTarget,
+	options: RenderSkillOptions = {},
 ): PlannedFile[] {
 	const name = parsed.manifest.name;
 	const spec = RUNTIME_HARNESS_SPECS[target];
 	const baseDir = `${spec.skillsDir}/${name}`;
+	const companionRootDir = options.globalHome ? `~/${baseDir}` : baseDir;
 	const files: PlannedFile[] = [];
 	const globs =
 		parsed.manifest.routing_signals.files_any.length > 0
@@ -23,7 +29,7 @@ export function renderSkillFilesForRuntime(
 	const body = rewriteBundledSkillPaths(
 		parsed.markdownBody.trim(),
 		parsed,
-		baseDir,
+		companionRootDir,
 	);
 
 	if (spec.skillFormat === "progressive-skill-dir") {
@@ -31,7 +37,11 @@ export function renderSkillFilesForRuntime(
 			target,
 			itemName: name,
 			relativePath: `${baseDir}/SKILL.md`,
-			content: rewriteProgressiveSkillRawText(parsed.rawText, parsed, baseDir),
+			content: rewriteProgressiveSkillRawText(
+				parsed.rawText,
+				parsed,
+				companionRootDir,
+			),
 		});
 		appendCompanionSkillFiles(files, parsed, target, baseDir);
 		return files;

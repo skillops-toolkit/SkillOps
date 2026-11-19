@@ -644,7 +644,8 @@ describe("Track 2 — CLI Audit, Help Invariants, Security & 28-IDE Transpiler S
 		expect(cursorMdc.content).toContain(
 			"\".cursor/rules/path-rewrite-demo/assets/schema.json\"",
 		);
-		expect(cursorMdc.content).toContain(
+		expect(cursorMdc.content).toContain("- Bare evals: evals/evals.json");
+		expect(cursorMdc.content).not.toContain(
 			".cursor/rules/path-rewrite-demo/evals/evals.json",
 		);
 		expect(cursorMdc.content).not.toContain(

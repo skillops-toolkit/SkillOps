@@ -459,7 +459,7 @@ describe("SkillOps Multi-Runtime Add & Remove Engine", () => {
 			).toBe("created");
 
 			const tableOut = stripAnsi(formatSyncReport(report, "table", false));
-			expect(tableOut).toContain("4 created, 1 skipped");
+			expect(tableOut).toContain("2 created, 1 skipped");
 			expect(tableOut).toContain("Skipped — Already Exists (1)");
 			expect(tableOut).toContain(
 				"(claude) mcp-architect already exists at .claude/skills/mcp-architect/SKILL.md",
@@ -1110,7 +1110,6 @@ describe("SkillOps Multi-Runtime Add & Remove Engine", () => {
 			const expectedCompanionRelPaths = [
 				"assets/schema.json",
 				"assets/templates/prompt.txt",
-				"evals/evals.json",
 				"references/checklist.md",
 				"references/rules.yaml",
 				"scripts/audit.py",
@@ -1128,19 +1127,20 @@ describe("SkillOps Multi-Runtime Add & Remove Engine", () => {
 			);
 			expect(report.passed).toBe(true);
 
-			// 1. Verify progressive-skill-dir targets (claude, antigravity) receive SKILL.md + all companion files
+			// 1. Verify progressive-skill-dir targets (claude, antigravity) receive SKILL.md + bundleable companion files (never evals/ or .DS_Store)
 			for (const base of [
 				path.join(tmpRepo, ".claude", "skills", "polyglot-bundler"),
 				path.join(tmpRepo, ".agent", "skills", "polyglot-bundler"),
 			]) {
 				expect(fs.existsSync(path.join(base, "SKILL.md"))).toBe(true);
 				expect(fs.existsSync(path.join(base, ".DS_Store"))).toBe(false);
+				expect(fs.existsSync(path.join(base, "evals", "evals.json"))).toBe(false);
 				for (const rel of expectedCompanionRelPaths) {
 					expect(fs.existsSync(path.join(base, rel))).toBe(true);
 				}
 			}
 
-			// 2. Verify rule-based targets (cursor, copilot, windsurf) receive native rule file + all companion files + localized paths
+			// 2. Verify rule-based targets (cursor, copilot, windsurf) receive native rule file + bundleable companion files + localized paths (never evals/)
 			const cursorRulePath = path.join(
 				tmpRepo,
 				".cursor",
@@ -1151,6 +1151,11 @@ describe("SkillOps Multi-Runtime Add & Remove Engine", () => {
 			expect(fs.readFileSync(cursorRulePath, "utf-8")).toContain(
 				".cursor/rules/polyglot-bundler/scripts/audit.py",
 			);
+			expect(
+				fs.existsSync(
+					path.join(tmpRepo, ".cursor", "rules", "polyglot-bundler", "evals", "evals.json"),
+				),
+			).toBe(false);
 			for (const rel of expectedCompanionRelPaths) {
 				expect(
 					fs.existsSync(

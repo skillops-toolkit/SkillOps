@@ -31,7 +31,7 @@ const MAX_INPUT_PATH_CHARS = 256 * 1024;
 
 const SKILL_NAME_REGEX = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const SEMVER_REGEX = /^\d+\.\d+\.\d+$/;
-const FRONTMATTER_REGEX = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
+export const FRONTMATTER_REGEX = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 const WORD_REGEX = /\S+/g;
 const PUNCT_CODE_REGEX = /[{}[\]()<>:;,.=`~@#$%^&*|\\/]/g;
 
