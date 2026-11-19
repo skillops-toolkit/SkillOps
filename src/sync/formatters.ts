@@ -138,6 +138,11 @@ export function formatProjectStatusReport(
 			`- **Targets**: ${report.targets.length > 0 ? report.targets.map((t) => `\`${t}\``).join(", ") : "none"}`,
 			`- **Installed Skills**: \`${report.installed_skills.length}\``,
 			`- **Installed Subagents**: \`${report.installed_subagents.length}\``,
+			...(report.token_telemetry
+				? [
+						`- **Token Telemetry**: L1 \`${report.token_telemetry.total_l1_tokens}\` · Always-On \`${report.token_telemetry.always_on_tokens}/${report.token_telemetry.max_always_on_tokens}\``,
+					]
+				: []),
 			`- **Lockfile Present**: \`${report.lockfile_present}\``,
 			`- **Status**: **${report.passed ? "PASS" : "DRIFT DETECTED"}**`,
 			"",
@@ -198,6 +203,9 @@ export function formatProjectStatusReport(
 							style.dim(", ", c),
 						)} ${fgHex(CHARM_PALETTE.lavender, `+${report.targets.length - 3} more (${report.targets.length} IDEs)`, c)}`;
 	const targetsLine = `${bar}  ${padVisible(fgHex(CHARM_PALETTE.lavender, style.bold("Targets:", c), c), 10, "left")}${visibleTargets}`;
+	const telemetryLine = report.token_telemetry
+		? `${bar}  ${padVisible(fgHex(CHARM_PALETTE.lavender, style.bold("Tokens:", c), c), 10, "left")}${fgHex(CHARM_PALETTE.white, `L1: ${report.token_telemetry.total_l1_tokens}`, c)} ${style.dim("·", c)} ${fgHex(report.token_telemetry.warnings.length > 0 ? CHARM_PALETTE.amber : CHARM_PALETTE.mint, `Always-On: ${report.token_telemetry.always_on_tokens}/${report.token_telemetry.max_always_on_tokens}`, c)}`
+		: "";
 
 	const totalModules =
 		report.installed_skills.length + report.installed_subagents.length;
@@ -302,6 +310,7 @@ export function formatProjectStatusReport(
 		statusLine,
 		healthLine,
 		targetsLine,
+		telemetryLine,
 		...moduleLines,
 		...artifactLines,
 		nextSteps,

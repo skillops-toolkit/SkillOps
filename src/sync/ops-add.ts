@@ -20,7 +20,7 @@ import {
 	collectInstalledAiderConventionPaths,
 	renderAiderReadConfig,
 } from "./aider-config.js";
-import { loadCatalogIndex } from "./catalog-index.js";
+import { type CatalogIndex, loadCatalogIndex } from "./catalog-index.js";
 import {
 	collectInstalledCodexCatalogItems,
 	renderCodexAgentsIndex,
@@ -43,6 +43,7 @@ import {
 	loadExistingLockfile,
 	writeLockfileAtomically,
 } from "./lockfile.js";
+import { computeLockfileL1Tokens } from "./telemetry.js";
 import { renderSkillFilesForRuntime } from "./renderers/skills.js";
 import { renderSubagentFilesForRuntime } from "./renderers/subagents.js";
 import {
@@ -75,6 +76,7 @@ function applyPlannedFiles(
 		addedSubagentName?: string;
 		codexAgentsIndexContent?: string;
 		aiderConfigContent?: string;
+		catalogIndex?: CatalogIndex;
 	},
 ): SyncReport {
 	const canonicalRepo = fs.existsSync(resolvedRepo) ? fs.realpathSync(resolvedRepo) : null;
@@ -309,13 +311,26 @@ function applyPlannedFiles(
 			]),
 		];
 
+		const resolvedCatalogIndex =
+			options.catalogIndex ??
+			(() => {
+				try {
+					return loadCatalogIndex(resolvedCatalog);
+				} catch {
+					return undefined;
+				}
+			})();
 		const lockData: SyncLockfile = SyncLockfileSchema.parse({
 			schema_version: "1.0",
 			skillops_version: SKILLOPS_VERSION,
 			targets: mergedTargets,
 			selected_skills: mergedSkills,
 			selected_subagents: mergedSubagents,
-			total_l1_tokens: existingLock?.total_l1_tokens ?? 0,
+			total_l1_tokens: computeLockfileL1Tokens(
+				mergedSkills,
+				mergedSubagents,
+				resolvedCatalogIndex,
+			),
 			artifacts: newLockArtifacts,
 		});
 		writeLockfileAtomically(lockfilePath, lockData);
@@ -467,6 +482,7 @@ export function addSkillOrSubagent(
 			addedSubagentName: matchedSubagent?.manifest.name,
 			codexAgentsIndexContent,
 			aiderConfigContent,
+			catalogIndex: index,
 		},
 	);
 }

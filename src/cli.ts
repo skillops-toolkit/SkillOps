@@ -9,6 +9,8 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	auditCatalogSecurity,
+	DEFAULT_SEMANTIC_COLLISION_THRESHOLD,
+	detectSemanticCollisions,
 	discoverSkillDirectories,
 	discoverSubagentFiles,
 	type ParsedSkillDirectory,
@@ -16,6 +18,7 @@ import {
 	type ParseSkillOptions,
 	parseSkillDirectory,
 	parseSubagentFile,
+	type SemanticCollisionPair,
 	type SkillSecurityFinding,
 } from "./auditor/index.js";
 import {
@@ -416,6 +419,7 @@ export interface CatalogAuditReport {
 	readonly rendered_artifacts_count: number;
 	readonly contract_errors: string[];
 	readonly security_findings: SkillSecurityFinding[];
+	readonly collision_pairs?: SemanticCollisionPair[];
 }
 
 function isErrorSecurityFinding(finding: SkillSecurityFinding): boolean {
@@ -454,11 +458,16 @@ function formatCatalogAuditReport(
 			`- **Dry-Run Artifacts Rendered**: \`${report.rendered_artifacts_count}\``,
 			`- **Contract Errors**: \`${report.contract_errors.length}\``,
 			`- **Security Findings**: \`${report.security_findings.length}\``,
+			`- **Semantic Collisions**: \`${(report.collision_pairs ?? []).length}\``,
 			`- **Status**: **${report.passed ? "PASS" : "FAIL"}**`,
 			"",
 			...report.contract_errors.map((err) => `- [CONTRACT] ${sanitizeErrorMsg(err)}`),
 			...report.security_findings.map(
 				(f) => `- [SECURITY:${f.rule}] \`${f.file}:${f.line}\` — ${f.message}`,
+			),
+			...(report.collision_pairs ?? []).map(
+				(pair) =>
+					`- [COLLISION] \`${pair.kind_a}:${pair.item_a}\` <-> \`${pair.kind_b}:${pair.item_b}\` (similarity=${pair.similarity})`,
 			),
 			"",
 		].join("\n");
@@ -502,6 +511,23 @@ function formatCatalogAuditReport(
 				summary.length > 68 ? `${summary.slice(0, 67)}…` : summary;
 			detailLines.push(
 				`${bar}  ${fgHex(CHARM_PALETTE.coral, shortSummary, c)}`,
+			);
+		}
+	}
+	if ((report.collision_pairs ?? []).length > 0) {
+		const collisions = report.collision_pairs ?? [];
+		detailLines.push(
+			renderSectionHeader(
+				`Semantic Collisions (${collisions.length})`,
+				c,
+			),
+		);
+		for (const pair of collisions.slice(0, 8)) {
+			const summary = `${pair.item_a} <-> ${pair.item_b} (${pair.similarity.toFixed(2)})`;
+			const shortSummary =
+				summary.length > 68 ? `${summary.slice(0, 67)}…` : summary;
+			detailLines.push(
+				`${bar}  ${fgHex(CHARM_PALETTE.amber, shortSummary, c)}`,
 			);
 		}
 	}
@@ -1138,6 +1164,7 @@ export function runCli(argv: readonly string[]): number {
 			const report = inspectProjectStatus(repoPath, catalogDir, {
 				targets,
 				catalogIndex,
+				config: cfgRes.config,
 			});
 			const budgetErr = evaluateTokenEconomyBudget(
 				cfgRes.config,
@@ -1146,6 +1173,9 @@ export function runCli(argv: readonly string[]): number {
 				catalogIndex,
 			);
 			process.stdout.write(formatProjectStatusReport(report, format));
+			for (const warning of report.token_telemetry?.warnings ?? []) {
+				process.stderr.write(`Warning: ${warning}\n`);
+			}
 			if (budgetErr) {
 				process.stderr.write(`${budgetErr}\n`);
 				return ExitCode.BUDGET_OR_CONTRACT_ERROR;
@@ -1325,9 +1355,21 @@ export function runCli(argv: readonly string[]): number {
 				}
 			}
 
+			const collisionThreshold = cfgRes.exists && cfgRes.config
+				? cfgRes.config.token_economy.max_similarity
+				: DEFAULT_SEMANTIC_COLLISION_THRESHOLD;
+			const collisionReport = detectSemanticCollisions(skills, subagents, {
+				threshold: collisionThreshold,
+			});
+
 			const hasSecurityFailure =
 				errorSecurityFindings.length > 0 || hasParserSecurityError;
-			const passed = !hasSecurityFailure && contractErrors.length === 0;
+			const hasCollisionFailure =
+				strict && collisionReport.collisions.length > 0;
+			const passed =
+				!hasSecurityFailure &&
+				!hasCollisionFailure &&
+				contractErrors.length === 0;
 
 			const auditReport: CatalogAuditReport = {
 				catalog_path: normalizedCatalog,
@@ -1339,12 +1381,16 @@ export function runCli(argv: readonly string[]): number {
 				rendered_artifacts_count: renderedArtifactsCount,
 				contract_errors: contractErrors,
 				security_findings: secReport.findings,
+				collision_pairs: collisionReport.collisions,
 			};
 
 			process.stdout.write(formatCatalogAuditReport(auditReport, format));
 
 			if (hasSecurityFailure) {
 				return ExitCode.SECURITY_BOUNDARY_ERROR;
+			}
+			if (hasCollisionFailure) {
+				return ExitCode.COLLISION_ERROR;
 			}
 			if (contractErrors.length > 0) {
 				return ExitCode.BUDGET_OR_CONTRACT_ERROR;

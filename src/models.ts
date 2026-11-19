@@ -1364,6 +1364,7 @@ export const SkillOpsTokenEconomyConfigSchema = z
 		startup_tax_budget: z.number().int().min(100).max(1_000_000).default(2500),
 		max_active_skills: z.number().int().min(1).max(12).default(12),
 		max_l1_tokens: z.number().int().min(40).max(1_000_000).default(1500),
+		max_always_on_tokens: z.number().int().min(100).max(1_000_000).default(4000),
 		max_similarity: z.number().min(0.1).max(0.99).default(0.78),
 	})
 	.strict();
@@ -1404,6 +1405,7 @@ export const SkillOpsConfigSchema = z
 			startup_tax_budget: 2500,
 			max_active_skills: 12,
 			max_l1_tokens: 1500,
+			max_always_on_tokens: 4000,
 			max_similarity: 0.78,
 		}),
 		detected_stack: SkillOpsDetectedStackConfigSchema.default({
