@@ -43,6 +43,7 @@ import { renderSubagentFilesForRuntime } from "./renderers/subagents.js";
 import {
 	type AddOptions,
 	assertCustomCatalogSkillSafe,
+	assertCustomCatalogSubagentSafe,
 	type ArtifactHealthState,
 	type CleanOptions,
 	type InstalledArtifactStatus,
@@ -313,6 +314,8 @@ export function addSkillOrSubagent(
 
 	if (matchedSkill) {
 		assertCustomCatalogSkillSafe(resolvedCatalog, matchedSkill);
+	} else if (matchedSubagent) {
+		assertCustomCatalogSubagentSafe(resolvedCatalog, matchedSubagent);
 	}
 
 	const plannedFiles: PlannedFile[] = [];

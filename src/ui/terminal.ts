@@ -513,6 +513,8 @@ export const DEFAULT_VALID_COMMANDS: readonly string[] = [
 	"remove",
 	"uninstall",
 	"rm",
+	"audit",
+	"doctor",
 ];
 
 /**

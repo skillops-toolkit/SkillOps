@@ -43,6 +43,7 @@ import {
 	inspectProjectStatus,
 	loadCatalogIndex,
 	removeSkillOrSubagent,
+	toPortableReportPath,
 	updateInstalledSkills,
 } from "./sync/index.js";
 import {
@@ -51,8 +52,10 @@ import {
 	fgHex,
 	findCommandHelpSpec,
 	formatBadge,
+	isInteractiveTty,
 	type MultiSelectOption,
 	padVisible,
+	PromptCancelledError,
 	renderCancelledStep,
 	renderCommandHelp,
 	renderCompletedStep,
@@ -69,6 +72,225 @@ const PACKAGE_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"..",
 );
+
+type CanonicalCliCommand =
+	| "add"
+	| "remove"
+	| "status"
+	| "update"
+	| "audit"
+	| "help"
+	| "version";
+
+const COMMAND_ALIAS_MAP: Readonly<Record<string, CanonicalCliCommand>> = {
+	add: "add",
+	install: "add",
+	i: "add",
+	remove: "remove",
+	uninstall: "remove",
+	rm: "remove",
+	status: "status",
+	list: "status",
+	ls: "status",
+	update: "update",
+	sync: "update",
+	upgrade: "update",
+	audit: "audit",
+	doctor: "audit",
+	help: "help",
+	version: "version",
+};
+
+const KNOWN_VALUE_FLAGS = new Set<string>([
+	"-p",
+	"--project",
+	"--repo",
+	"-t",
+	"--target",
+	"--targets",
+	"--harness",
+	"--harnesses",
+	"-a",
+	"--agent",
+	"--agents",
+	"--catalog",
+	"-f",
+	"--format",
+]);
+
+const SHARED_GLOBAL_FLAGS = [
+	"-h",
+	"--help",
+	"-V",
+	"--version",
+	"-p",
+	"--project",
+	"--repo",
+	"-g",
+	"--global",
+	"--catalog",
+	"-f",
+	"--format",
+	"--json",
+] as const;
+
+const TARGET_FLAGS = [
+	"-t",
+	"--target",
+	"--targets",
+	"--harness",
+	"--harnesses",
+	"--agent",
+	"--agents",
+] as const;
+
+const COMMAND_ALLOWED_FLAGS: Readonly<
+	Record<CanonicalCliCommand, ReadonlySet<string>>
+> = {
+	add: new Set([...SHARED_GLOBAL_FLAGS, ...TARGET_FLAGS, "--auto", "--all", "--dry-run", "--force"]),
+	remove: new Set([...SHARED_GLOBAL_FLAGS, ...TARGET_FLAGS, "--all", "--dry-run", "--force"]),
+	status: new Set([...SHARED_GLOBAL_FLAGS, ...TARGET_FLAGS, "--auto"]),
+	update: new Set([...SHARED_GLOBAL_FLAGS, ...TARGET_FLAGS, "--auto", "--dry-run", "--force"]),
+	audit: new Set([...SHARED_GLOBAL_FLAGS, "--strict"]),
+	help: new Set(["-h", "--help", "-V", "--version"]),
+	version: new Set(["-h", "--help", "-V", "--version"]),
+};
+
+const ALL_KNOWN_FLAGS = new Set<string>([
+	...SHARED_GLOBAL_FLAGS,
+	...TARGET_FLAGS,
+	"--auto",
+	"--all",
+	"--dry-run",
+	"--force",
+	"--strict",
+]);
+
+interface ParsedCliInvocation {
+	readonly rawCommand: string;
+	readonly canonicalCommand: CanonicalCliCommand | null;
+	readonly positionals: string[];
+	readonly flagValues: ReadonlyMap<string, string[]>;
+	readonly seenFlags: string[];
+	readonly error?: string;
+}
+
+function parseCliInvocation(args: readonly string[]): ParsedCliInvocation {
+	const flagValues = new Map<string, string[]>();
+	const seenFlags: string[] = [];
+	const positionals: string[] = [];
+	let rawCommand = "";
+	let canonicalCommand: CanonicalCliCommand | null = null;
+	let afterDoubleDash = false;
+
+	const recordValue = (flag: string, val: string) => {
+		const list = flagValues.get(flag) ?? [];
+		list.push(val);
+		flagValues.set(flag, list);
+	};
+
+	for (let i = 0; i < args.length; i++) {
+		const token = args[i];
+		if (!token) {
+			continue;
+		}
+		if (afterDoubleDash) {
+			if (!rawCommand) {
+				rawCommand = token;
+				canonicalCommand = COMMAND_ALIAS_MAP[token] ?? null;
+			} else {
+				positionals.push(token);
+			}
+			continue;
+		}
+		if (token === "--") {
+			afterDoubleDash = true;
+			continue;
+		}
+		if (token.startsWith("-") && token !== "-") {
+			const eqIdx = token.indexOf("=");
+			const flagName = eqIdx > 0 ? token.slice(0, eqIdx) : token;
+			seenFlags.push(flagName);
+			if (eqIdx > 0) {
+				if (!KNOWN_VALUE_FLAGS.has(flagName)) {
+					return {
+						rawCommand,
+						canonicalCommand,
+						positionals,
+						flagValues,
+						seenFlags,
+						error: `Option '${flagName}' does not take an inline value.`,
+					};
+				}
+				const inlineVal = token.slice(eqIdx + 1);
+				if (!inlineVal) {
+					return {
+						rawCommand,
+						canonicalCommand,
+						positionals,
+						flagValues,
+						seenFlags,
+						error: `Flag '${flagName}' requires a non-empty value.`,
+					};
+				}
+				recordValue(flagName, inlineVal);
+				continue;
+			}
+			if (KNOWN_VALUE_FLAGS.has(flagName)) {
+				const next = args[i + 1];
+				if (!next || next === "--" || (next.startsWith("-") && next.length > 1)) {
+					return {
+						rawCommand,
+						canonicalCommand,
+						positionals,
+						flagValues,
+						seenFlags,
+						error: `Flag '${flagName}' requires a value.`,
+					};
+				}
+				recordValue(flagName, next);
+				i += 1;
+			}
+			continue;
+		}
+		if (!rawCommand) {
+			rawCommand = token;
+			canonicalCommand = COMMAND_ALIAS_MAP[token] ?? null;
+		} else {
+			positionals.push(token);
+		}
+	}
+
+	const allowedSet = canonicalCommand
+		? COMMAND_ALLOWED_FLAGS[canonicalCommand]
+		: ALL_KNOWN_FLAGS;
+	for (const seenFlag of seenFlags) {
+		if (!allowedSet.has(seenFlag)) {
+			const suggestion = suggestCommand(seenFlag, [...allowedSet]);
+			const hint = suggestion ? ` Did you mean '${suggestion}'?` : "";
+			const scope = canonicalCommand
+				? ` for '${rawCommand}'`
+				: "";
+			const helpTarget = canonicalCommand ? `${rawCommand} ` : "";
+			return {
+				rawCommand,
+				canonicalCommand,
+				positionals,
+				flagValues,
+				seenFlags,
+				error: `Unknown option '${seenFlag}'${scope}.${hint} Run 'npx skillops-cli ${helpTarget}--help'.`,
+			};
+		}
+	}
+
+	return {
+		rawCommand,
+		canonicalCommand,
+		positionals,
+		flagValues,
+		seenFlags,
+	};
+}
 
 function getAllFlagValues(
 	args: readonly string[],
@@ -106,39 +328,6 @@ function getFlagValue(
 	...flagNames: string[]
 ): string | undefined {
 	return getAllFlagValues(args, ...flagNames)[0];
-}
-
-function getPositionalArgs(args: readonly string[]): string[] {
-	const valueTakingFlags = new Set([
-		"--repo",
-		"--project",
-		"-p",
-		"--targets",
-		"--harness",
-		"--harnesses",
-		"--target",
-		"-t",
-		"--agents",
-		"--agent",
-		"--catalog",
-		"--format",
-		"-f",
-	]);
-	const positionals: string[] = [];
-	for (let i = 1; i < args.length; i++) {
-		const arg = args[i];
-		if (!arg) {
-			continue;
-		}
-		if (arg.startsWith("-")) {
-			if (valueTakingFlags.has(arg)) {
-				i += 1;
-			}
-			continue;
-		}
-		positionals.push(arg);
-	}
-	return positionals;
 }
 
 function resolveOutputFormat(
@@ -239,14 +428,25 @@ function formatCatalogAuditReport(
 	format: "table" | "json" | "markdown" = "table",
 	colorEnabled?: boolean,
 ): string {
+	const portableCatalog = toPortableReportPath(report.catalog_path);
+	const sanitizeErrorMsg = (msg: string): string =>
+		report.catalog_path
+			? msg.split(report.catalog_path).join(portableCatalog)
+			: msg;
+
 	if (format === "json") {
-		return `${JSON.stringify(report, null, 2)}\n`;
+		const sanitizedReport: CatalogAuditReport = {
+			...report,
+			catalog_path: portableCatalog,
+			contract_errors: report.contract_errors.map(sanitizeErrorMsg),
+		};
+		return `${JSON.stringify(sanitizedReport, null, 2)}\n`;
 	}
 	if (format === "markdown") {
 		return [
 			"## SkillOps Catalog & Security Audit Report",
 			"",
-			`- **Catalog**: \`${report.catalog_path}\``,
+			`- **Catalog**: \`${portableCatalog}\``,
 			`- **Strict Layout**: \`${report.strict}\``,
 			`- **Skills Parsed**: \`${report.skills_count}\``,
 			`- **Subagents Parsed**: \`${report.subagents_count}\``,
@@ -256,7 +456,7 @@ function formatCatalogAuditReport(
 			`- **Security Findings**: \`${report.security_findings.length}\``,
 			`- **Status**: **${report.passed ? "PASS" : "FAIL"}**`,
 			"",
-			...report.contract_errors.map((err) => `- [CONTRACT] ${err}`),
+			...report.contract_errors.map((err) => `- [CONTRACT] ${sanitizeErrorMsg(err)}`),
 			...report.security_findings.map(
 				(f) => `- [SECURITY:${f.rule}] \`${f.file}:${f.line}\` — ${f.message}`,
 			),
@@ -332,33 +532,55 @@ function formatCatalogAuditReport(
 		.join("\n");
 }
 
+function isCanonicalSameDirectory(dirA: string, dirB: string): boolean {
+	try {
+		return fs.realpathSync(path.resolve(dirA)) === fs.realpathSync(path.resolve(dirB));
+	} catch {
+		return path.resolve(dirA) === path.resolve(dirB);
+	}
+}
+
 function resolveCatalogDir(
 	args: readonly string[],
-	repoPath?: string,
-	loadedConfig?: SkillOpsConfig | null,
 ): string {
 	const catalogFlag = getFlagValue(args, "--catalog");
 	if (catalogFlag) {
 		return path.resolve(catalogFlag);
 	}
-	const baseRepo = repoPath ? path.resolve(repoPath) : process.cwd();
-	if (loadedConfig?.catalog_dir) {
-		const cfgCatalog = path.resolve(baseRepo, loadedConfig.catalog_dir);
-		if (fs.existsSync(cfgCatalog)) {
-			return cfgCatalog;
+	if (isCanonicalSameDirectory(process.cwd(), PACKAGE_ROOT)) {
+		const cwdCatalog = path.join(process.cwd(), "catalog");
+		if (fs.existsSync(cwdCatalog)) {
+			return cwdCatalog;
 		}
-	}
-	if (repoPath) {
-		const repoCatalog = path.join(path.resolve(repoPath), "catalog");
-		if (fs.existsSync(repoCatalog)) {
-			return repoCatalog;
-		}
-	}
-	const cwdCatalog = path.resolve(process.cwd(), "catalog");
-	if (fs.existsSync(cwdCatalog)) {
-		return cwdCatalog;
 	}
 	return path.join(PACKAGE_ROOT, "catalog");
+}
+
+function evaluateTokenEconomyBudget(
+	config: SkillOpsConfig | null,
+	skillNames: readonly string[],
+	catalogDir: string,
+	catalogIndex?: ReturnType<typeof loadCatalogIndex>,
+): string | null {
+	if (!config) {
+		return null;
+	}
+	const index = catalogIndex ?? loadCatalogIndex(catalogDir);
+	const uniqueSkills = [...new Set(skillNames)].filter((n) => index.skills.has(n));
+	if (uniqueSkills.length > config.token_economy.max_active_skills) {
+		return `Token economy violation: ${uniqueSkills.length} active skill(s) exceed .skillops.yml max_active_skills (${config.token_economy.max_active_skills}).`;
+	}
+	const totalL1 = uniqueSkills.reduce(
+		(acc, name) => acc + (index.skills.get(name)?.manifest.description_tokens ?? 0),
+		0,
+	);
+	if (totalL1 > config.token_economy.startup_tax_budget) {
+		return `Token economy violation: total L1 startup tax (${totalL1} tokens) exceeds .skillops.yml startup_tax_budget (${config.token_economy.startup_tax_budget}).`;
+	}
+	if (totalL1 > config.token_economy.max_l1_tokens) {
+		return `Token economy violation: total L1 tokens (${totalL1}) exceed .skillops.yml max_l1_tokens (${config.token_economy.max_l1_tokens}).`;
+	}
+	return null;
 }
 
 const POPULAR_AI_ORDER: readonly RuntimeTarget[] = [
@@ -642,17 +864,28 @@ export function buildInteractiveInstalledOptions(
 
 export function runCli(argv: readonly string[]): number {
 	const args = argv.slice(2);
+	if (args.length === 0) {
+		process.stdout.write(`${renderGlobalHelp(SKILLOPS_VERSION)}\n`);
+		return ExitCode.SUCCESS;
+	}
+
+	const parsed = parseCliInvocation(args);
+	if (parsed.error) {
+		process.stderr.write(`${parsed.error}\n`);
+		return ExitCode.ERROR;
+	}
+
 	if (
 		args.includes("--version") ||
 		args.includes("-V") ||
-		args[0] === "version"
+		parsed.canonicalCommand === "version"
 	) {
 		process.stdout.write(`skillops ${SKILLOPS_VERSION}\n`);
 		return ExitCode.SUCCESS;
 	}
 
-	if (args[0] === "help") {
-		const targetCmd = args[1];
+	if (parsed.canonicalCommand === "help") {
+		const targetCmd = parsed.positionals[0];
 		if (targetCmd && !targetCmd.startsWith("-")) {
 			const spec = findCommandHelpSpec(targetCmd);
 			if (spec) {
@@ -664,15 +897,9 @@ export function runCli(argv: readonly string[]): number {
 		return ExitCode.SUCCESS;
 	}
 
-	if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
-		process.stdout.write(`${renderGlobalHelp(SKILLOPS_VERSION)}\n`);
-		return ExitCode.SUCCESS;
-	}
-
 	if (args.includes("--help") || args.includes("-h")) {
-		const firstCmd = args[0];
-		if (firstCmd) {
-			const spec = findCommandHelpSpec(firstCmd);
+		if (parsed.rawCommand) {
+			const spec = findCommandHelpSpec(parsed.rawCommand);
 			if (spec) {
 				process.stdout.write(`${renderCommandHelp(spec, SKILLOPS_VERSION)}\n`);
 				return ExitCode.SUCCESS;
@@ -682,19 +909,33 @@ export function runCli(argv: readonly string[]): number {
 		return ExitCode.SUCCESS;
 	}
 
-	const command = args[0] ?? "";
+	const rawFmt = getFlagValue(args, "--format", "-f");
+	if (
+		rawFmt !== undefined &&
+		rawFmt !== "table" &&
+		rawFmt !== "json" &&
+		rawFmt !== "md" &&
+		rawFmt !== "markdown"
+	) {
+		process.stderr.write(
+			`Invalid --format '${rawFmt}'. Expected one of: table, json, md, markdown.\n`,
+		);
+		return ExitCode.ERROR;
+	}
 
-	if (command === "add" || command === "install" || command === "i") {
-		const positionals = getPositionalArgs(args);
+	const command = parsed.canonicalCommand;
+	const positionals = parsed.positionals;
+
+	if (command === "add") {
 		const repoPath = resolveTargetRepoPath(args);
 		const cfgRes = loadSkillOpsConfig(repoPath);
 		if (cfgRes.error) {
 			process.stderr.write(
-				`Invalid .skillops.yml at ${cfgRes.configPath}: ${cfgRes.error}\n`,
+				`Invalid .skillops.yml at ${toPortableReportPath(cfgRes.configPath, repoPath)}: ${cfgRes.error}\n`,
 			);
 			return ExitCode.BUDGET_OR_CONTRACT_ERROR;
 		}
-		const catalogDir = resolveCatalogDir(args, repoPath, cfgRes.config);
+		const catalogDir = resolveCatalogDir(args);
 		const targetsArg = resolveTargetsArg(args);
 		let targets: RuntimeTarget[];
 		try {
@@ -709,14 +950,9 @@ export function runCli(argv: readonly string[]): number {
 		const dryRun = args.includes("--dry-run");
 		const force = args.includes("--force");
 		const format = resolveOutputFormat(args);
-
 		const importAll = args.includes("--all");
-		const itemsToAdd =
-			importAll && positionals.length === 0
-				? buildInteractiveCatalogOptions(catalogDir).map((o) => o.value)
-				: positionals;
 
-		if (itemsToAdd.length === 0) {
+		if (!importAll && positionals.length === 0) {
 			process.stderr.write(
 				"Usage: npx skillops-cli add <skill-or-subagent-name> [more-names...] [options]\n",
 			);
@@ -724,7 +960,44 @@ export function runCli(argv: readonly string[]): number {
 		}
 
 		try {
-			const catalogIndex = loadCatalogIndex(catalogDir);
+			const catalogIndex = loadCatalogIndex(catalogDir, {
+				strict: importAll && positionals.length === 0,
+			});
+			const itemsToAdd =
+				importAll && positionals.length === 0
+					? [...catalogIndex.skills.keys(), ...catalogIndex.subagents.keys()]
+					: positionals;
+
+			if (itemsToAdd.length === 0) {
+				process.stderr.write(
+					`No Skills or Subagents found in catalog '${toPortableReportPath(catalogDir, repoPath)}'.\n`,
+				);
+				return ExitCode.ERROR;
+			}
+
+			if (cfgRes.config && !force) {
+				const existingStatus = inspectProjectStatus(repoPath, catalogDir, {
+					targets,
+					catalogIndex,
+				});
+				const combinedSkills = [
+					...new Set([
+						...existingStatus.installed_skills,
+						...itemsToAdd.filter((n) => catalogIndex.skills.has(n)),
+					]),
+				];
+				const budgetErr = evaluateTokenEconomyBudget(
+					cfgRes.config,
+					combinedSkills,
+					catalogDir,
+					catalogIndex,
+				);
+				if (budgetErr) {
+					process.stderr.write(`${budgetErr}\n`);
+					return ExitCode.BUDGET_OR_CONTRACT_ERROR;
+				}
+			}
+
 			const reports = itemsToAdd.map((itemName) =>
 				addSkillOrSubagent(repoPath, catalogDir, itemName, {
 					targets,
@@ -757,22 +1030,23 @@ export function runCli(argv: readonly string[]): number {
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			process.stderr.write(`Error: ${msg}\n`);
-			return ExitCode.ERROR;
+			return msg.startsWith("Security violation")
+				? ExitCode.SECURITY_BOUNDARY_ERROR
+				: ExitCode.ERROR;
 		}
 	}
 
-	if (command === "remove" || command === "uninstall" || command === "rm") {
-		const positionals = getPositionalArgs(args);
+	if (command === "remove") {
 		const removeAll = args.includes("--all");
 		const repoPath = resolveTargetRepoPath(args);
 		const cfgRes = loadSkillOpsConfig(repoPath);
 		if (cfgRes.error) {
 			process.stderr.write(
-				`Invalid .skillops.yml at ${cfgRes.configPath}: ${cfgRes.error}\n`,
+				`Invalid .skillops.yml at ${toPortableReportPath(cfgRes.configPath, repoPath)}: ${cfgRes.error}\n`,
 			);
 			return ExitCode.BUDGET_OR_CONTRACT_ERROR;
 		}
-		const catalogDir = resolveCatalogDir(args, repoPath, cfgRes.config);
+		const catalogDir = resolveCatalogDir(args);
 		const rawTargetsArg = resolveTargetsArg(args);
 		const dryRun = args.includes("--dry-run");
 		const force = args.includes("--force");
@@ -781,7 +1055,7 @@ export function runCli(argv: readonly string[]): number {
 		try {
 			const targets = rawTargetsArg
 				? resolveRuntimeTargets(rawTargetsArg, repoPath)
-				: undefined;
+				: cfgRes.config?.targets;
 
 			if (removeAll && positionals.length === 0 && !targets) {
 				const report = cleanSyncedArtifacts(repoPath, catalogDir, {
@@ -843,25 +1117,39 @@ export function runCli(argv: readonly string[]): number {
 		}
 	}
 
-	if (command === "status" || command === "list" || command === "ls") {
+	if (command === "status") {
 		const repoPath = resolveTargetRepoPath(args);
 		const cfgRes = loadSkillOpsConfig(repoPath);
 		if (cfgRes.error) {
 			process.stderr.write(
-				`Invalid .skillops.yml at ${cfgRes.configPath}: ${cfgRes.error}\n`,
+				`Invalid .skillops.yml at ${toPortableReportPath(cfgRes.configPath, repoPath)}: ${cfgRes.error}\n`,
 			);
 			return ExitCode.BUDGET_OR_CONTRACT_ERROR;
 		}
-		const catalogDir = resolveCatalogDir(args, repoPath, cfgRes.config);
+		const catalogDir = resolveCatalogDir(args);
 		const rawTargetsArg = resolveTargetsArg(args);
 		const format = resolveOutputFormat(args);
 
 		try {
 			const targets = rawTargetsArg
 				? resolveRuntimeTargets(rawTargetsArg, repoPath)
-				: undefined;
-			const report = inspectProjectStatus(repoPath, catalogDir, { targets });
+				: cfgRes.config?.targets;
+			const catalogIndex = loadCatalogIndex(catalogDir);
+			const report = inspectProjectStatus(repoPath, catalogDir, {
+				targets,
+				catalogIndex,
+			});
+			const budgetErr = evaluateTokenEconomyBudget(
+				cfgRes.config,
+				report.installed_skills,
+				catalogDir,
+				catalogIndex,
+			);
 			process.stdout.write(formatProjectStatusReport(report, format));
+			if (budgetErr) {
+				process.stderr.write(`${budgetErr}\n`);
+				return ExitCode.BUDGET_OR_CONTRACT_ERROR;
+			}
 			return report.passed ? ExitCode.SUCCESS : ExitCode.ERROR;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -870,17 +1158,16 @@ export function runCli(argv: readonly string[]): number {
 		}
 	}
 
-	if (command === "update" || command === "sync" || command === "upgrade") {
-		const positionals = getPositionalArgs(args);
+	if (command === "update") {
 		const repoPath = resolveTargetRepoPath(args);
 		const cfgRes = loadSkillOpsConfig(repoPath);
 		if (cfgRes.error) {
 			process.stderr.write(
-				`Invalid .skillops.yml at ${cfgRes.configPath}: ${cfgRes.error}\n`,
+				`Invalid .skillops.yml at ${toPortableReportPath(cfgRes.configPath, repoPath)}: ${cfgRes.error}\n`,
 			);
 			return ExitCode.BUDGET_OR_CONTRACT_ERROR;
 		}
-		const catalogDir = resolveCatalogDir(args, repoPath, cfgRes.config);
+		const catalogDir = resolveCatalogDir(args);
 		const rawTargetsArg = resolveTargetsArg(args);
 		const dryRun = args.includes("--dry-run");
 		const force = args.includes("--force");
@@ -889,34 +1176,53 @@ export function runCli(argv: readonly string[]): number {
 		try {
 			const targets = rawTargetsArg
 				? resolveRuntimeTargets(rawTargetsArg, repoPath)
-				: undefined;
+				: cfgRes.config?.targets;
+			const catalogIndex = loadCatalogIndex(catalogDir);
+			if (cfgRes.config && !force) {
+				const existingStatus = inspectProjectStatus(repoPath, catalogDir, {
+					targets,
+					catalogIndex,
+				});
+				const budgetErr = evaluateTokenEconomyBudget(
+					cfgRes.config,
+					existingStatus.installed_skills,
+					catalogDir,
+					catalogIndex,
+				);
+				if (budgetErr) {
+					process.stderr.write(`${budgetErr}\n`);
+					return ExitCode.BUDGET_OR_CONTRACT_ERROR;
+				}
+			}
 			const report = updateInstalledSkills(repoPath, catalogDir, {
 				targets,
 				names: positionals.length > 0 ? positionals : undefined,
 				dryRun,
 				force,
+				catalogIndex,
 			});
 			process.stdout.write(formatSyncReport(report, format));
 			return report.passed ? ExitCode.SUCCESS : ExitCode.ERROR;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			process.stderr.write(`Error: ${msg}\n`);
-			return ExitCode.ERROR;
+			return msg.startsWith("Security violation")
+				? ExitCode.SECURITY_BOUNDARY_ERROR
+				: ExitCode.ERROR;
 		}
 	}
 
 	switch (command) {
-		case "audit":
-		case "doctor": {
+		case "audit": {
 			const repoPath = resolveTargetRepoPath(args);
 			const cfgRes = loadSkillOpsConfig(repoPath);
 			if (cfgRes.error) {
 				process.stderr.write(
-					`Invalid .skillops.yml at ${cfgRes.configPath}: ${cfgRes.error}\n`,
+					`Invalid .skillops.yml at ${toPortableReportPath(cfgRes.configPath, repoPath)}: ${cfgRes.error}\n`,
 				);
 				return ExitCode.BUDGET_OR_CONTRACT_ERROR;
 			}
-			const catalogDir = resolveCatalogDir(args, repoPath, cfgRes.config);
+			const catalogDir = resolveCatalogDir(args);
 			const strict = args.includes("--strict");
 			const format = resolveOutputFormat(args);
 			const normalizedCatalog = path.resolve(catalogDir).replace(/\\/g, "/");
@@ -1038,7 +1344,7 @@ export function runCli(argv: readonly string[]): number {
 			process.stdout.write(formatCatalogAuditReport(auditReport, format));
 
 			if (hasSecurityFailure) {
-				return ExitCode.ERROR;
+				return ExitCode.SECURITY_BOUNDARY_ERROR;
 			}
 			if (contractErrors.length > 0) {
 				return ExitCode.BUDGET_OR_CONTRACT_ERROR;
@@ -1047,14 +1353,11 @@ export function runCli(argv: readonly string[]): number {
 		}
 	}
 
-	const suggestion = suggestCommand(command, [
-		...DEFAULT_VALID_COMMANDS,
-		"audit",
-		"doctor",
-	]);
+	const unknownCmd = parsed.rawCommand || (args[0] ?? "");
+	const suggestion = suggestCommand(unknownCmd, DEFAULT_VALID_COMMANDS);
 	const hint = suggestion ? ` Did you mean '${suggestion}'?` : "";
 	process.stderr.write(
-		`Unknown command '${command}'.${hint} Run 'npx skillops-cli --help'.\n`,
+		`Unknown command '${unknownCmd}'.${hint} Run 'npx skillops-cli --help'.\n`,
 	);
 	return ExitCode.ERROR;
 }
@@ -1063,133 +1366,152 @@ export async function runCliInteractive(
 	argv: readonly string[],
 ): Promise<number> {
 	const args = argv.slice(2);
-	const command = args[0];
+	const parsed = parseCliInvocation(args);
+	if (parsed.error) {
+		process.stderr.write(`${parsed.error}\n`);
+		return ExitCode.ERROR;
+	}
+
+	const command = parsed.canonicalCommand;
 
 	if (
-		(command === "add" || command === "install" || command === "i") &&
+		command === "add" &&
 		!args.includes("--help") &&
 		!args.includes("-h") &&
-		process.stdin.isTTY &&
-		process.stdout.isTTY
+		isInteractiveTty()
 	) {
 		const repoPath = resolveTargetRepoPath(args);
 		const globalTag = isGlobalFlag(args) ? " [Global: ~]" : "";
 		const cfgRes = loadSkillOpsConfig(repoPath);
 		if (cfgRes.error) {
 			process.stderr.write(
-				`Invalid .skillops.yml at ${cfgRes.configPath}: ${cfgRes.error}\n`,
+				`Invalid .skillops.yml at ${toPortableReportPath(cfgRes.configPath, repoPath)}: ${cfgRes.error}\n`,
 			);
 			return ExitCode.BUDGET_OR_CONTRACT_ERROR;
 		}
-		const catalogDir = resolveCatalogDir(args, repoPath, cfgRes.config);
+		const catalogDir = resolveCatalogDir(args);
 		const explicitTargetsArg = resolveTargetsArg(args);
-		const positionals = getPositionalArgs(args);
+		const positionals = parsed.positionals;
 		const needsCatalogPrompt =
 			!args.includes("--all") && positionals.length === 0;
 
 		let resolvedTargetsArg = explicitTargetsArg;
-
-		// Step 1: Explicitly select AI IDE / Agent when -t / --target is not passed
-		if (!resolvedTargetsArg) {
-			const targetOptions = buildInteractiveTargetOptions(repoPath);
-			const step1Title = `${
-				needsCatalogPrompt
-					? "SkillOps — Step 1/2: Select Your AI IDE / Agent"
-					: "SkillOps — Select Your AI IDE / Agent"
-			}${globalTag}`;
-			const selectedTargets = await runMultiSelectPrompt(
-				step1Title,
-				targetOptions,
-				{
-					subtitle:
-						"Select one or more AI coding assistants with Space · Enter to continue",
-					tabLabels: {
-						skill: "AI IDEs & Agents",
-						agent: "",
-					},
-					submitActionLabel: "continue",
-					selectCursorOnEmptySubmit: true,
-					showSelectAll: true,
-				},
-			);
-
-			if (!selectedTargets || selectedTargets.length === 0) {
-				process.stdout.write(`${renderCancelledStep("No AI IDE selected.")}\n`);
-				return ExitCode.SUCCESS;
-			}
-			resolvedTargetsArg = selectedTargets.join(",");
-			process.stdout.write(
-				`${renderCompletedStep(needsCatalogPrompt ? "Step 1/2 · AI IDE(s)" : "AI IDE(s)", selectedTargets.join(", "))}\n`,
-			);
-		}
-
-		let targets: RuntimeTarget[];
-		try {
-			targets = resolveRuntimeTargets(resolvedTargetsArg, repoPath);
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			process.stderr.write(`Invalid --targets: ${msg}\n`);
-			return ExitCode.BUDGET_OR_CONTRACT_ERROR;
-		}
-
 		const extraArgs: string[] = [];
-		if (!explicitTargetsArg) {
-			extraArgs.push("-t", targets.join(","));
-		}
 
-		// Step 2: Select Skills & Agents when no names or --all were passed
-		if (needsCatalogPrompt) {
-			const options = buildInteractiveCatalogOptions(catalogDir, {
-				repoPath,
-				targets,
-			});
-			const step2Title = `${
-				!explicitTargetsArg
-					? "SkillOps — Step 2/2: Select Skills & Agents to Import"
-					: "SkillOps — Select Skills & Agents to Import"
-			}${globalTag}`;
-			const selected = await runMultiSelectPrompt(step2Title, options, {
-				subtitle: "Switch tabs with ←/→ · Press Space to select · Enter to install",
-				targetHint: targets.join(", "),
-				showSelectAll: true,
-			});
-
-			if (!selected || selected.length === 0) {
-				process.stdout.write(
-					`${renderCancelledStep("No Skills or Agents selected.")}\n`,
+		try {
+			// Step 1: Explicitly select AI IDE / Agent when -t / --target is not passed
+			if (!resolvedTargetsArg) {
+				const targetOptions = buildInteractiveTargetOptions(repoPath);
+				const step1Title = `${
+					needsCatalogPrompt
+						? "SkillOps — Step 1/2: Select Your AI IDE / Agent"
+						: "SkillOps — Select Your AI IDE / Agent"
+				}${globalTag}`;
+				const selectedTargets = await runMultiSelectPrompt(
+					step1Title,
+					targetOptions,
+					{
+						subtitle:
+							"Select one or more AI coding assistants with Space · Enter to continue",
+						tabLabels: {
+							skill: "AI IDEs & Agents",
+							agent: "",
+						},
+						submitActionLabel: "continue",
+						selectCursorOnEmptySubmit: true,
+						showSelectAll: true,
+						throwOnInterrupt: true,
+					},
 				);
-				return ExitCode.SUCCESS;
+
+				if (!selectedTargets || selectedTargets.length === 0) {
+					process.stdout.write(
+						`${renderCancelledStep("No AI IDE selected.")}\n`,
+					);
+					return ExitCode.SUCCESS;
+				}
+				resolvedTargetsArg = selectedTargets.join(",");
+				process.stdout.write(
+					`${renderCompletedStep(needsCatalogPrompt ? "Step 1/2 · AI IDE(s)" : "AI IDE(s)", selectedTargets.join(", "))}\n`,
+				);
 			}
-			process.stdout.write(
-				`${renderCompletedStep(!explicitTargetsArg ? "Step 2/2 · Selected" : "Selected", selected.join(", "))}\n\n`,
-			);
-			extraArgs.push(...selected);
-		} else if (!explicitTargetsArg) {
-			process.stdout.write("\n");
+
+			let targets: RuntimeTarget[];
+			try {
+				targets = resolveRuntimeTargets(resolvedTargetsArg, repoPath);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				process.stderr.write(`Invalid --targets: ${msg}\n`);
+				return ExitCode.BUDGET_OR_CONTRACT_ERROR;
+			}
+
+			if (!explicitTargetsArg) {
+				extraArgs.push("-t", targets.join(","));
+			}
+
+			// Step 2: Select Skills & Agents when no names or --all were passed
+			if (needsCatalogPrompt) {
+				const options = buildInteractiveCatalogOptions(catalogDir, {
+					repoPath,
+					targets,
+				});
+				const step2Title = `${
+					!explicitTargetsArg
+						? "SkillOps — Step 2/2: Select Skills & Agents to Import"
+						: "SkillOps — Select Skills & Agents to Import"
+				}${globalTag}`;
+				const selected = await runMultiSelectPrompt(step2Title, options, {
+					subtitle:
+						"Switch tabs with ←/→ · Press Space to select · Enter to install",
+					targetHint: targets.join(", "),
+					showSelectAll: true,
+					throwOnInterrupt: true,
+				});
+
+				if (!selected || selected.length === 0) {
+					process.stdout.write(
+						`${renderCancelledStep("No Skills or Agents selected.")}\n`,
+					);
+					return ExitCode.SUCCESS;
+				}
+				process.stdout.write(
+					`${renderCompletedStep(!explicitTargetsArg ? "Step 2/2 · Selected" : "Selected", selected.join(", "))}\n\n`,
+				);
+				extraArgs.push(...selected);
+			} else if (!explicitTargetsArg) {
+				process.stdout.write("\n");
+			}
+		} catch (err) {
+			if (err instanceof PromptCancelledError) {
+				process.stdout.write(
+					`${renderCancelledStep("Cancelled by user (Ctrl+C).")}\n`,
+				);
+				return err.exitCode;
+			}
+			throw err;
 		}
 
 		return runCli([...argv, ...extraArgs]);
 	}
 
 	if (
-		(command === "remove" || command === "uninstall" || command === "rm") &&
+		command === "remove" &&
 		!args.includes("--help") &&
 		!args.includes("-h") &&
 		!args.includes("--all") &&
-		process.stdin.isTTY &&
-		process.stdout.isTTY
+		isInteractiveTty()
 	) {
-		const positionals = getPositionalArgs(args);
+		const positionals = parsed.positionals;
 		const repoPath = resolveTargetRepoPath(args);
 		const globalTag = isGlobalFlag(args) ? " [Global: ~]" : "";
 		const cfgRes = loadSkillOpsConfig(repoPath);
 		if (cfgRes.error) {
 			process.stderr.write(
-				`Invalid .skillops.yml at ${cfgRes.configPath}: ${cfgRes.error}\n`,
+				`Invalid .skillops.yml at ${toPortableReportPath(cfgRes.configPath, repoPath)}: ${cfgRes.error}\n`,
 			);
 			return ExitCode.BUDGET_OR_CONTRACT_ERROR;
 		}
-		const catalogDir = resolveCatalogDir(args, repoPath, cfgRes.config);
+		const catalogDir = resolveCatalogDir(args);
 		const explicitTargetsArg = resolveTargetsArg(args);
 		const needsItemsPrompt = positionals.length === 0;
 
@@ -1197,107 +1519,124 @@ export async function runCliInteractive(
 		let promptedForTargets = false;
 		const extraArgs: string[] = [];
 
-		if (explicitTargetsArg) {
-			try {
-				targets = resolveRuntimeTargets(explicitTargetsArg, repoPath);
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				process.stderr.write(`Invalid --targets: ${msg}\n`);
-				return ExitCode.BUDGET_OR_CONTRACT_ERROR;
-			}
-		} else {
-			const installedTargetOptions = buildInteractiveInstalledTargetOptions(
-				repoPath,
-				catalogDir,
-				positionals.length > 0 ? positionals : undefined,
-			);
-			if (installedTargetOptions.length === 0 && needsItemsPrompt) {
-				process.stdout.write(
-					`${renderCancelledStep("No imported Skills or Agents found in this project.")}\n`,
+		try {
+			if (explicitTargetsArg) {
+				try {
+					targets = resolveRuntimeTargets(explicitTargetsArg, repoPath);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					process.stderr.write(`Invalid --targets: ${msg}\n`);
+					return ExitCode.BUDGET_OR_CONTRACT_ERROR;
+				}
+			} else {
+				const installedTargetOptions = buildInteractiveInstalledTargetOptions(
+					repoPath,
+					catalogDir,
+					positionals.length > 0 ? positionals : undefined,
 				);
-				return ExitCode.SUCCESS;
-			}
-
-			if (installedTargetOptions.length > 1) {
-				promptedForTargets = true;
-				const step1Title = `${
-					needsItemsPrompt
-						? "SkillOps — Step 1/2: Select AI IDE(s) to Remove From"
-						: "SkillOps — Select AI IDE(s) to Remove From"
-				}${globalTag}`;
-				const selectedTargets = await runMultiSelectPrompt(
-					step1Title,
-					installedTargetOptions,
-					{
-						subtitle:
-							"Select one or more AI IDEs with Space · Enter to continue",
-						tabLabels: {
-							skill: "Installed AI IDEs",
-							agent: "",
-						},
-						submitActionLabel: "continue",
-						selectCursorOnEmptySubmit: true,
-						showSelectAll: true,
-					},
-				);
-
-				if (!selectedTargets || selectedTargets.length === 0) {
+				if (installedTargetOptions.length === 0 && needsItemsPrompt) {
 					process.stdout.write(
-						`${renderCancelledStep("No AI IDE selected for removal.")}\n`,
+						`${renderCancelledStep("No imported Skills or Agents found in this project.")}\n`,
 					);
 					return ExitCode.SUCCESS;
 				}
-				targets = resolveRuntimeTargets(selectedTargets.join(","), repoPath);
-				process.stdout.write(
-					`${renderCompletedStep(needsItemsPrompt ? "Step 1/2 · AI IDE(s)" : "AI IDE(s)", targets.join(", "))}\n`,
-				);
-				extraArgs.push("-t", targets.join(","));
-			} else if (installedTargetOptions.length === 1) {
-				const singleTarget = installedTargetOptions[0]?.value;
-				if (singleTarget) {
-					targets = resolveRuntimeTargets(singleTarget, repoPath);
+
+				if (installedTargetOptions.length > 1) {
+					promptedForTargets = true;
+					const step1Title = `${
+						needsItemsPrompt
+							? "SkillOps — Step 1/2: Select AI IDE(s) to Remove From"
+							: "SkillOps — Select AI IDE(s) to Remove From"
+					}${globalTag}`;
+					const selectedTargets = await runMultiSelectPrompt(
+						step1Title,
+						installedTargetOptions,
+						{
+							subtitle:
+								"Select one or more AI IDEs with Space · Enter to continue",
+							tabLabels: {
+								skill: "Installed AI IDEs",
+								agent: "",
+							},
+							submitActionLabel: "continue",
+							selectCursorOnEmptySubmit: true,
+							showSelectAll: true,
+							throwOnInterrupt: true,
+						},
+					);
+
+					if (!selectedTargets || selectedTargets.length === 0) {
+						process.stdout.write(
+							`${renderCancelledStep("No AI IDE selected for removal.")}\n`,
+						);
+						return ExitCode.SUCCESS;
+					}
+					targets = resolveRuntimeTargets(selectedTargets.join(","), repoPath);
+					process.stdout.write(
+						`${renderCompletedStep(needsItemsPrompt ? "Step 1/2 · AI IDE(s)" : "AI IDE(s)", targets.join(", "))}\n`,
+					);
+					extraArgs.push("-t", targets.join(","));
+				} else if (installedTargetOptions.length === 1) {
+					const singleTarget = installedTargetOptions[0]?.value;
+					if (singleTarget) {
+						targets = resolveRuntimeTargets(singleTarget, repoPath);
+					}
 				}
 			}
-		}
 
-		if (needsItemsPrompt) {
-			const installedOptions = buildInteractiveInstalledOptions(
-				repoPath,
-				catalogDir,
-				targets,
-			);
-			if (installedOptions.length === 0) {
-				process.stdout.write(
-					`${renderCancelledStep("No imported Skills or Agents found in this project.")}\n`,
+			if (needsItemsPrompt) {
+				const installedOptions = buildInteractiveInstalledOptions(
+					repoPath,
+					catalogDir,
+					targets,
 				);
-				return ExitCode.SUCCESS;
-			}
+				if (installedOptions.length === 0) {
+					process.stdout.write(
+						`${renderCancelledStep("No imported Skills or Agents found in this project.")}\n`,
+					);
+					return ExitCode.SUCCESS;
+				}
 
-			const step2Title = `${
-				promptedForTargets
-					? "SkillOps — Step 2/2: Select Installed Skills & Agents to Remove"
-					: "SkillOps — Select Installed Skills & Agents to Remove"
-			}${globalTag}`;
-			const selected = await runMultiSelectPrompt(step2Title, installedOptions, {
-				subtitle: "Select installed items with Space · Press Enter to remove",
-				submitActionLabel: "remove",
-				targetHint: targets ? targets.join(", ") : undefined,
-				showSelectAll: true,
-			});
-
-			if (!selected || selected.length === 0) {
-				process.stdout.write(
-					`${renderCancelledStep("No Skills or Agents selected for removal.")}\n`,
+				const step2Title = `${
+					promptedForTargets
+						? "SkillOps — Step 2/2: Select Installed Skills & Agents to Remove"
+						: "SkillOps — Select Installed Skills & Agents to Remove"
+				}${globalTag}`;
+				const selected = await runMultiSelectPrompt(
+					step2Title,
+					installedOptions,
+					{
+						subtitle:
+							"Select installed items with Space · Press Enter to remove",
+						submitActionLabel: "remove",
+						targetHint: targets ? targets.join(", ") : undefined,
+						showSelectAll: true,
+						throwOnInterrupt: true,
+					},
 				);
-				return ExitCode.SUCCESS;
-			}
 
-			process.stdout.write(
-				`${renderCompletedStep(promptedForTargets ? "Step 2/2 · Selected to remove" : "Selected to remove", selected.join(", "))}\n\n`,
-			);
-			extraArgs.push(...selected);
-		} else if (promptedForTargets) {
-			process.stdout.write("\n");
+				if (!selected || selected.length === 0) {
+					process.stdout.write(
+						`${renderCancelledStep("No Skills or Agents selected for removal.")}\n`,
+					);
+					return ExitCode.SUCCESS;
+				}
+
+				process.stdout.write(
+					`${renderCompletedStep(promptedForTargets ? "Step 2/2 · Selected to remove" : "Selected to remove", selected.join(", "))}\n\n`,
+				);
+				extraArgs.push(...selected);
+			} else if (promptedForTargets) {
+				process.stdout.write("\n");
+			}
+		} catch (err) {
+			if (err instanceof PromptCancelledError) {
+				process.stdout.write(
+					`${renderCancelledStep("Cancelled by user (Ctrl+C).")}\n`,
+				);
+				return err.exitCode;
+			}
+			throw err;
 		}
 
 		if (extraArgs.length > 0) {

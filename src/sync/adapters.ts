@@ -18,6 +18,7 @@ export {
 export {
 	formatProjectStatusReport,
 	formatSyncReport,
+	toPortableReportPath,
 } from "./formatters.js";
 export {
 	computeSha256,

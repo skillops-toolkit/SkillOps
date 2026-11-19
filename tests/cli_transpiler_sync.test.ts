@@ -380,7 +380,7 @@ describe("Track 2 — CLI Audit, Help Invariants, Security & 28-IDE Transpiler S
 			"-f",
 			"json",
 		]);
-		expect(badRes.code).toBe(ExitCode.ERROR);
+		expect(badRes.code).toBe(ExitCode.SECURITY_BOUNDARY_ERROR);
 		const badJson = JSON.parse(badRes.stdout) as {
 			passed: boolean;
 			security_findings: Array<{ rule: string }>;
@@ -807,6 +807,12 @@ describe("Track 2 — CLI Audit, Help Invariants, Security & 28-IDE Transpiler S
 			const origPause = process.stdin.pause;
 			const origSetEncoding = process.stdin.setEncoding;
 			const origStdoutIsTTY = stdoutObj.isTTY;
+			const origCI = process.env.CI;
+			const origGhActions = process.env.GITHUB_ACTIONS;
+			const origTerm = process.env.TERM;
+			delete process.env.CI;
+			delete process.env.GITHUB_ACTIONS;
+			process.env.TERM = "xterm-256color";
 
 			const rawModeCalls: boolean[] = [];
 			let capturedOut = "";
@@ -862,6 +868,21 @@ describe("Track 2 — CLI Audit, Help Invariants, Security & 28-IDE Transpiler S
 				process.stdin.pause = origPause;
 				process.stdin.setEncoding = origSetEncoding;
 				stdoutObj.isTTY = origStdoutIsTTY;
+				if (origCI === undefined) {
+					delete process.env.CI;
+				} else {
+					process.env.CI = origCI;
+				}
+				if (origGhActions === undefined) {
+					delete process.env.GITHUB_ACTIONS;
+				} else {
+					process.env.GITHUB_ACTIONS = origGhActions;
+				}
+				if (origTerm === undefined) {
+					delete process.env.TERM;
+				} else {
+					process.env.TERM = origTerm;
+				}
 			}
 		}
 	});
