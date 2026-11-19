@@ -30,11 +30,11 @@ const MCP_ARCHITECT_EVALS_DIR = path.join(
 
 const VALID_SHA256 = "a".repeat(64);
 
-describe("Contract Alignment & Hardened Models (v1.5.2)", () => {
+describe("Contract Alignment & Hardened Models (v1.6.0)", () => {
 	it("exposes ExitCode.SECURITY_BOUNDARY_ERROR === 5", () => {
 		expect(ExitCode.SECURITY_BOUNDARY_ERROR).toBe(5);
 		expect(ExitCode.SUCCESS).toBe(0);
-		expect(SKILLOPS_VERSION).toBe("1.5.2");
+		expect(SKILLOPS_VERSION).toBe("1.6.0");
 	});
 
 	it("trims trailing slashes deterministically in linear time via trimTrailingSlashes and SkillDirectorySchema", () => {

@@ -185,7 +185,7 @@ describe("SkillOps Core Models & Subagent Contracts", () => {
 		expect(runCli(["node", "cli.js", "help", "status"])).toBe(ExitCode.SUCCESS);
 		expect(runCli(["node", "cli.js", "help", "update"])).toBe(ExitCode.SUCCESS);
 		expect(runCli(["node", "cli.js", "help", "remove"])).toBe(ExitCode.SUCCESS);
-		expect(SKILLOPS_VERSION).toBe("1.5.2");
+		expect(SKILLOPS_VERSION).toBe("1.6.0");
 	});
 
 	it("validates Top-28 AI Coding Agent registry, auto-detection matrix, and target resolution", () => {
