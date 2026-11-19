@@ -22,6 +22,12 @@ import {
 	type SkillSecurityFinding,
 } from "./auditor/index.js";
 import {
+	generateShellCompletions,
+	isSupportedCompletionShell,
+	SUPPORTED_COMPLETION_SHELLS,
+} from "./commands/completions.js";
+import { formatDoctorReport, runWorkspaceDoctor } from "./commands/doctor.js";
+import {
 	ALL_RUNTIME_TARGETS,
 	detectInstalledHarnesses,
 	ExitCode,
@@ -82,6 +88,8 @@ type CanonicalCliCommand =
 	| "status"
 	| "update"
 	| "audit"
+	| "doctor"
+	| "completions"
 	| "help"
 	| "version";
 
@@ -99,7 +107,8 @@ const COMMAND_ALIAS_MAP: Readonly<Record<string, CanonicalCliCommand>> = {
 	sync: "update",
 	upgrade: "update",
 	audit: "audit",
-	doctor: "audit",
+	doctor: "doctor",
+	completions: "completions",
 	help: "help",
 	version: "version",
 };
@@ -155,6 +164,8 @@ const COMMAND_ALLOWED_FLAGS: Readonly<
 	status: new Set([...SHARED_GLOBAL_FLAGS, ...TARGET_FLAGS, "--auto"]),
 	update: new Set([...SHARED_GLOBAL_FLAGS, ...TARGET_FLAGS, "--auto", "--dry-run", "--force"]),
 	audit: new Set([...SHARED_GLOBAL_FLAGS, "--strict"]),
+	doctor: new Set([...SHARED_GLOBAL_FLAGS]),
+	completions: new Set(["-h", "--help", "-V", "--version"]),
 	help: new Set(["-h", "--help", "-V", "--version"]),
 	version: new Set(["-h", "--help", "-V", "--version"]),
 };
@@ -1395,6 +1406,41 @@ export function runCli(argv: readonly string[]): number {
 			if (contractErrors.length > 0) {
 				return ExitCode.BUDGET_OR_CONTRACT_ERROR;
 			}
+			return ExitCode.SUCCESS;
+		}
+		case "doctor": {
+			const repoPath = resolveTargetRepoPath(args);
+			const catalogDir = resolveCatalogDir(args);
+			const format = resolveOutputFormat(args);
+			try {
+				const report = runWorkspaceDoctor(repoPath, catalogDir);
+				process.stdout.write(formatDoctorReport(report, format));
+				if (!report.passed) {
+					const hasBudgetOrConfigErr = report.checks.some(
+						(c) =>
+							c.status === "fail" &&
+							(c.id === "config-validity" || c.id === "startup-token-budget"),
+					);
+					return hasBudgetOrConfigErr
+						? ExitCode.BUDGET_OR_CONTRACT_ERROR
+						: ExitCode.ERROR;
+				}
+				return ExitCode.SUCCESS;
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				process.stderr.write(`Error: ${msg}\n`);
+				return ExitCode.ERROR;
+			}
+		}
+		case "completions": {
+			const shell = (positionals[0] ?? "").trim().toLowerCase();
+			if (!isSupportedCompletionShell(shell)) {
+				process.stderr.write(
+					`Usage: npx skillops-cli completions <${SUPPORTED_COMPLETION_SHELLS.join("|")}>\n`,
+				);
+				return ExitCode.ERROR;
+			}
+			process.stdout.write(generateShellCompletions(shell));
 			return ExitCode.SUCCESS;
 		}
 	}

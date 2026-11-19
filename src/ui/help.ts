@@ -202,7 +202,7 @@ export const COMMAND_HELP_SPECS: readonly CommandHelpSpec[] = [
 	},
 	{
 		name: "audit",
-		aliases: ["doctor"],
+		aliases: [],
 		summary:
 			"Validate catalog manifests, Level 3 layout, security & transpilation",
 		usage: "npx skillops-cli audit [options]",
@@ -228,6 +228,55 @@ export const COMMAND_HELP_SPECS: readonly CommandHelpSpec[] = [
 			{
 				command: "skillops audit --json",
 				description: "Export machine-readable audit report as JSON",
+			},
+		],
+	},
+	{
+		name: "doctor",
+		aliases: [],
+		summary:
+			"Run a zero-mutation 5-point workspace health & token budget diagnostic",
+		usage: "npx skillops-cli doctor [options]",
+		options: [
+			{
+				flags: "-p, --project, --repo <dir>",
+				description: "Target repository folder (default: current directory)",
+			},
+			{
+				flags: "-g, --global",
+				description: "Diagnose global user home (~) installations",
+			},
+			{
+				flags: "--json, -f, --format <fmt>",
+				description: "Output format: table, json, or md (default: table)",
+			},
+		],
+		examples: [
+			{
+				command: "skillops doctor",
+				description: "Diagnose config, lockfile drift, symlinks & token tax",
+			},
+			{
+				command: "skillops doctor --json",
+				description: "Export machine-readable workspace diagnostic JSON",
+			},
+		],
+	},
+	{
+		name: "completions",
+		aliases: [],
+		summary:
+			"Generate shell tab-completion scripts (bash, zsh, fish, pwsh)",
+		usage: "npx skillops-cli completions <bash|zsh|fish|pwsh>",
+		options: [],
+		examples: [
+			{
+				command: "skillops completions pwsh",
+				description: "Emit PowerShell completion script",
+			},
+			{
+				command: "skillops completions bash",
+				description: "Emit Bash completion script",
 			},
 		],
 	},
@@ -292,6 +341,11 @@ export function renderGlobalHelp(
 			color: CHARM_PALETTE.indigo,
 			desc: "Validate catalog contracts, layout & static security",
 		},
+		{
+			cmd: "doctor",
+			color: CHARM_PALETTE.mint,
+			desc: "Diagnose config, lockfile drift, symlinks & token tax",
+		},
 	];
 
 	const cmdRows = coreCmds
@@ -301,7 +355,7 @@ export function renderGlobalHelp(
 		)
 		.join("\n");
 
-	const usageLine = `${bar}  ${fgHex(CHARM_PALETTE.lavender, style.bold("Usage:", c), c)} ${style.bold(style.green("skillops", c), c)} ${fgHex(CHARM_PALETTE.cyan, "<add|status|update|remove|audit>", c)} ${style.dim("[options]", c)}`;
+	const usageLine = `${bar}  ${fgHex(CHARM_PALETTE.lavender, style.bold("Usage:", c), c)} ${style.bold(style.green("skillops", c), c)} ${fgHex(CHARM_PALETTE.cyan, "<add|status|update|remove|audit|doctor>", c)} ${style.dim("[options]", c)}`;
 
 	return [
 		banner,
@@ -315,7 +369,6 @@ export function renderGlobalHelp(
 		`${bar}  ${padVisible(style.bold(style.cyan("--all", c), c), 24, "left")}${fgHex(CHARM_PALETTE.lavender, "Install or remove all Skills & Agents", c)}`,
 		renderSectionHeader("Examples", c),
 		`${bar}  ${fgHex(CHARM_PALETTE.hotPink, "$", c)} ${style.bold(style.green("skillops add --agents cursor", c), c)}                  ${style.dim("—", c)} ${fgHex(CHARM_PALETTE.lavender, "Install into Cursor IDE", c)}`,
-		`${bar}  ${fgHex(CHARM_PALETTE.hotPink, "$", c)} ${style.bold(style.green("skillops audit --strict", c), c)}                       ${style.dim("—", c)} ${fgHex(CHARM_PALETTE.lavender, "Validate catalog safety", c)}`,
 		`${style.dim("╰─", c)} ${fgHex(CHARM_PALETTE.lavender, "Run", c)} ${style.bold(style.cyan("skillops <cmd> -h", c), c)} ${fgHex(CHARM_PALETTE.lavender, "for command options.", c)}`,
 	].join("\n");
 }
