@@ -16,6 +16,10 @@ import {
 	type SyncReport,
 	SyncReportSchema,
 } from "../models.js";
+import {
+	collectInstalledAiderConventionPaths,
+	renderAiderReadConfig,
+} from "./aider-config.js";
 import { loadCatalogIndex } from "./catalog-index.js";
 import {
 	collectInstalledCodexCatalogItems,
@@ -70,6 +74,7 @@ function applyPlannedFiles(
 		addedSkillName?: string;
 		addedSubagentName?: string;
 		codexAgentsIndexContent?: string;
+		aiderConfigContent?: string;
 	},
 ): SyncReport {
 	const canonicalRepo = fs.existsSync(resolvedRepo) ? fs.realpathSync(resolvedRepo) : null;
@@ -87,6 +92,7 @@ function applyPlannedFiles(
 	const artifacts: SyncedArtifact[] = [];
 	const skippedExisting: string[] = [];
 	const driftConflicts: string[] = [];
+	const batchWrittenSha = new Map<string, string>();
 
 	for (const skipped of options.skippedTargetItems ?? []) {
 		skippedExisting.push(skipped.relativePath);
@@ -110,6 +116,9 @@ function applyPlannedFiles(
 		assertAllowedHarnessArtifactPath(pf.target, pf.relativePath, pf.itemName);
 		const fullPath = resolveSafeRepoTargetPath(resolvedRepo, pf.relativePath, canonicalRepo);
 		const desiredSha = computeSha256(pf.content);
+		if (batchWrittenSha.get(pf.relativePath) === desiredSha) {
+			continue;
+		}
 		const fileExists = isRegularFileNoFollow(fullPath);
 
 		if (fileExists) {
@@ -151,6 +160,7 @@ function applyPlannedFiles(
 				relative_path: pf.relativePath,
 				sha256: desiredSha,
 			};
+			batchWrittenSha.set(pf.relativePath, desiredSha);
 		} else {
 			if (!options.dryRun) {
 				fs.mkdirSync(path.dirname(fullPath), { recursive: true });
@@ -169,6 +179,7 @@ function applyPlannedFiles(
 				relative_path: pf.relativePath,
 				sha256: desiredSha,
 			};
+			batchWrittenSha.set(pf.relativePath, desiredSha);
 		}
 	}
 
@@ -205,13 +216,58 @@ function applyPlannedFiles(
 					skill_name: "codex-agents-index",
 					relative_path: "AGENTS.md",
 					sha256: desiredSha,
-					action: options.dryRun ? "planned" : "updated",
+					action: options.dryRun ? "planned" : hasAgentsFile ? "updated" : "created",
 				});
 			}
 			newLockArtifacts["AGENTS.md"] = {
 				target: "codex",
 				skill_name: "codex-agents-index",
 				relative_path: "AGENTS.md",
+				sha256: desiredSha,
+			};
+		}
+	}
+
+	if (options.aiderConfigContent !== undefined) {
+		assertAllowedHarnessArtifactPath("aider", ".aider.conf.yml", "aider-read-config");
+		const safeAiderConf = resolveSafeRepoTargetPath(resolvedRepo, ".aider.conf.yml", canonicalRepo);
+		const hasAiderFile = isRegularFileNoFollow(safeAiderConf);
+		const diskText = hasAiderFile ? fs.readFileSync(safeAiderConf, "utf-8") : "";
+		const currentDiskSha = computeSha256(diskText);
+		const desiredSha = computeSha256(options.aiderConfigContent);
+		const existingAiderLock = getLockArtifact(existingLock?.artifacts, ".aider.conf.yml");
+		if (
+			hasAiderFile &&
+			existingAiderLock &&
+			currentDiskSha !== existingAiderLock.sha256 &&
+			!options.force
+		) {
+			driftConflicts.push(".aider.conf.yml");
+			artifacts.push({
+				target: "aider",
+				skill_name: "aider-read-config",
+				relative_path: ".aider.conf.yml",
+				sha256: currentDiskSha,
+				action: "conflict",
+			});
+			newLockArtifacts[".aider.conf.yml"] = existingAiderLock;
+		} else {
+			if (desiredSha !== currentDiskSha) {
+				if (!options.dryRun) {
+					fs.writeFileSync(safeAiderConf, options.aiderConfigContent, "utf-8");
+				}
+				artifacts.push({
+					target: "aider",
+					skill_name: "aider-read-config",
+					relative_path: ".aider.conf.yml",
+					sha256: desiredSha,
+					action: options.dryRun ? "planned" : hasAiderFile ? "updated" : "created",
+				});
+			}
+			newLockArtifacts[".aider.conf.yml"] = {
+				target: "aider",
+				skill_name: "aider-read-config",
+				relative_path: ".aider.conf.yml",
 				sha256: desiredSha,
 			};
 		}
@@ -355,15 +411,15 @@ export function addSkillOrSubagent(
 		plannedFiles.push(...targetPlanned);
 	}
 
+	const canonicalRepo = fs.existsSync(resolvedRepo) ? fs.realpathSync(resolvedRepo) : null;
+
 	let codexAgentsIndexContent: string | undefined;
-	if (
-		targets.includes("codex") &&
-		fs.existsSync(path.join(resolvedRepo, "AGENTS.md"))
-	) {
-		const canonicalRepo = fs.existsSync(resolvedRepo) ? fs.realpathSync(resolvedRepo) : null;
+	if (targets.includes("codex")) {
 		const safeAgentsMd = resolveSafeRepoTargetPath(resolvedRepo, "AGENTS.md", canonicalRepo);
-		if (isRegularFileNoFollow(safeAgentsMd)) {
-			const existingAgentsMd = fs.readFileSync(safeAgentsMd, "utf-8");
+		if (!fs.existsSync(safeAgentsMd) || isRegularFileNoFollow(safeAgentsMd)) {
+			const existingAgentsMd = isRegularFileNoFollow(safeAgentsMd)
+				? fs.readFileSync(safeAgentsMd, "utf-8")
+				: "";
 			const codexItems = collectInstalledCodexCatalogItems(
 				resolvedRepo,
 				resolvedCatalog,
@@ -376,6 +432,24 @@ export function addSkillOrSubagent(
 				codexItems.skills,
 				codexItems.subagents,
 			);
+		}
+	}
+
+	let aiderConfigContent: string | undefined;
+	if (targets.includes("aider")) {
+		const safeAiderConf = resolveSafeRepoTargetPath(resolvedRepo, ".aider.conf.yml", canonicalRepo);
+		if (!fs.existsSync(safeAiderConf) || isRegularFileNoFollow(safeAiderConf)) {
+			const existingAiderConf = isRegularFileNoFollow(safeAiderConf)
+				? fs.readFileSync(safeAiderConf, "utf-8")
+				: "";
+			const plannedAiderPaths = plannedFiles
+				.filter((pf) => pf.target === "aider")
+				.map((pf) => pf.relativePath);
+			const aiderConventions = collectInstalledAiderConventionPaths(
+				resolvedRepo,
+				plannedAiderPaths,
+			);
+			aiderConfigContent = renderAiderReadConfig(existingAiderConf, aiderConventions);
 		}
 	}
 
@@ -392,6 +466,7 @@ export function addSkillOrSubagent(
 			addedSkillName: matchedSkill?.manifest.name,
 			addedSubagentName: matchedSubagent?.manifest.name,
 			codexAgentsIndexContent,
+			aiderConfigContent,
 		},
 	);
 }

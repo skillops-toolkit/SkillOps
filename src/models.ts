@@ -389,9 +389,9 @@ export const RUNTIME_HARNESS_SPECS: Readonly<
 		vendor: "OpenAI",
 		category: "cli-agent",
 		skillFormat: "progressive-skill-dir",
-		skillsDir: ".codex/skills",
+		skillsDir: ".agents/skills",
 		subagentsDir: ".codex/agents",
-		detectionPaths: [".codex", "AGENTS.md"],
+		detectionPaths: [".codex", ".agents/skills", "AGENTS.md"],
 		alwaysOnFiles: ["AGENTS.md"],
 		mcpConfigPath: ".codex/config.toml",
 		supportsMcp: true,
@@ -471,10 +471,10 @@ export const RUNTIME_HARNESS_SPECS: Readonly<
 		displayName: "Zed AI",
 		vendor: "Zed Industries",
 		category: "ai-ide",
-		skillFormat: "markdown-rule",
-		skillsDir: ".zed/rules",
-		subagentsDir: ".zed/rules",
-		detectionPaths: [".zed", ".rules"],
+		skillFormat: "progressive-skill-dir",
+		skillsDir: ".agents/skills",
+		subagentsDir: ".zed/agents",
+		detectionPaths: [".zed", ".rules", ".agents/skills"],
 		alwaysOnFiles: [".rules"],
 		mcpConfigPath: ".zed/settings.json",
 		supportsMcp: true,
@@ -839,6 +839,13 @@ export function isAllowedHarnessArtifactPath(
 		return (
 			target === "codex" &&
 			(skillName === undefined || skillName === "codex-agents-index")
+		);
+	}
+
+	if (relPath === ".aider.conf.yml") {
+		return (
+			target === "aider" &&
+			(skillName === undefined || skillName === "aider-read-config")
 		);
 	}
 

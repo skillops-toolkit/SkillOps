@@ -81,6 +81,117 @@ function appendSubagentToolConstraints(
 	return block ? `${promptBody}\n\n${block}` : promptBody;
 }
 
+const CLAUDE_TOOL_MAP: Readonly<Record<string, readonly string[]>> = {
+	read: ["Read"],
+	search: ["Grep", "Glob"],
+	grep: ["Grep"],
+	glob: ["Glob"],
+	edit: ["Edit"],
+	write: ["Write"],
+	bash: ["Bash"],
+	shell: ["Bash"],
+	webfetch: ["WebFetch"],
+	websearch: ["WebSearch"],
+};
+
+const COPILOT_TOOL_MAP: Readonly<Record<string, readonly string[]>> = {
+	read: ["search"],
+	search: ["search", "usages"],
+	grep: ["search"],
+	glob: ["search"],
+	edit: ["edit"],
+	write: ["edit"],
+	bash: ["runCommands"],
+	shell: ["runCommands"],
+};
+
+/**
+ * Translate canonical SkillOps tool vocabulary (`read`, `search`, `edit`, `write`, `bash`)
+ * into vendor-native tool identifiers for Claude Code, GitHub Copilot, and peer harnesses.
+ */
+export function mapCanonicalToolsToRuntime(
+	tools: readonly string[],
+	target: RuntimeTarget,
+): string[] {
+	const mapped: string[] = [];
+	const seen = new Set<string>();
+	const pushUnique = (val: string): void => {
+		if (val && !seen.has(val)) {
+			seen.add(val);
+			mapped.push(val);
+		}
+	};
+
+	for (const rawTool of tools) {
+		const trimmed = rawTool.trim();
+		if (!trimmed) continue;
+		const key = trimmed.toLowerCase();
+		if (target === "claude") {
+			const nativeTools = CLAUDE_TOOL_MAP[key];
+			if (nativeTools) {
+				for (const t of nativeTools) pushUnique(t);
+			} else {
+				pushUnique(trimmed);
+			}
+		} else if (target === "copilot") {
+			const nativeTools = COPILOT_TOOL_MAP[key];
+			if (nativeTools) {
+				for (const t of nativeTools) pushUnique(t);
+			} else {
+				pushUnique(trimmed);
+			}
+		} else {
+			pushUnique(trimmed);
+		}
+	}
+	return mapped;
+}
+
+/**
+ * Encode a JavaScript UTF-16 string as a strict TOML v1.0 basic string, escaping `U+007F`
+ * and emitting UTF-32 `\UXXXXXXXX` sequences for astral plane characters instead of UTF-16 surrogates.
+ */
+export function encodeTomlBasicString(value: string): string {
+	let out = '"';
+	for (const ch of value) {
+		const cp = ch.codePointAt(0) ?? 0;
+		switch (cp) {
+			case 0x08:
+				out += "\\b";
+				break;
+			case 0x09:
+				out += "\\t";
+				break;
+			case 0x0a:
+				out += "\\n";
+				break;
+			case 0x0c:
+				out += "\\f";
+				break;
+			case 0x0d:
+				out += "\\r";
+				break;
+			case 0x22:
+				out += '\\"';
+				break;
+			case 0x5c:
+				out += "\\\\";
+				break;
+			default:
+				if (cp < 0x20 || cp === 0x7f) {
+					out += `\\u${cp.toString(16).toUpperCase().padStart(4, "0")}`;
+				} else if (cp > 0xffff) {
+					out += `\\U${cp.toString(16).toUpperCase().padStart(8, "0")}`;
+				} else {
+					out += ch;
+				}
+				break;
+		}
+	}
+	out += '"';
+	return out;
+}
+
 export function renderSubagentFilesForRuntime(
 	subagent: ParsedSubagentFile,
 	target: RuntimeTarget,
@@ -103,30 +214,77 @@ export function renderSubagentFilesForRuntime(
 		description: subagent.manifest.description,
 		model: "inherit",
 		model_tier: subagent.manifest.model_tier,
-		tools: subagent.manifest.tools,
+		tools: mapCanonicalToolsToRuntime(subagent.manifest.tools, target),
 		...(disallowedTools && disallowedTools.length > 0
-			? { disallowed_tools: disallowedTools }
+			? {
+					disallowed_tools: mapCanonicalToolsToRuntime(
+						disallowedTools,
+						target,
+					),
+				}
 			: {}),
 		max_output_tokens: subagent.manifest.max_output_tokens,
 	};
 	const fm = YAML.stringify(fmObj).trim();
-	const normalizedDoc = `---\n${fm}\n---\n\n${promptBody}\n`;
 	const constrainedNormalizedDoc = `---\n${fm}\n---\n\n${constrainedBody}\n`;
 
 	switch (target) {
-		case "claude":
-		case "antigravity":
-		case "codex":
-		case "opencode":
+		case "claude": {
+			const claudeTools = mapCanonicalToolsToRuntime(
+				subagent.manifest.tools,
+				"claude",
+			);
+			const claudeDisallowed =
+				disallowedTools && disallowedTools.length > 0
+					? mapCanonicalToolsToRuntime(disallowedTools, "claude")
+					: undefined;
+			const claudeFm = YAML.stringify({
+				name: subagent.manifest.name,
+				description: subagent.manifest.description,
+				model: "inherit",
+				tools: claudeTools,
+				...(claudeDisallowed && claudeDisallowed.length > 0
+					? { disallowedTools: claudeDisallowed }
+					: {}),
+			}).trim();
 			return [
 				{
 					target,
 					itemName: name,
 					relativePath: `${spec.subagentsDir}/${name}.md`,
-					content: normalizedDoc,
+					content: `---\n${claudeFm}\n---\n\n${constrainedBody}\n`,
 				},
 			];
+		}
 
+		case "codex": {
+			const hasWriteOrShell = subagent.manifest.tools.some(isMutatingOrShellTool);
+			const reasoningEffort =
+				subagent.manifest.model_tier === "fast"
+					? "low"
+					: subagent.manifest.model_tier === "reasoning"
+						? "high"
+						: "medium";
+			const codexToml = [
+				`name = ${encodeTomlBasicString(name)}`,
+				`description = ${encodeTomlBasicString(subagent.manifest.description)}`,
+				`model_reasoning_effort = ${encodeTomlBasicString(reasoningEffort)}`,
+				`sandbox_mode = ${encodeTomlBasicString(hasWriteOrShell ? "workspace-write" : "read-only")}`,
+				`developer_instructions = ${encodeTomlBasicString(constrainedBody)}`,
+				"",
+			].join("\n");
+			return [
+				{
+					target,
+					itemName: name,
+					relativePath: `${spec.subagentsDir}/${name}.toml`,
+					content: codexToml,
+				},
+			];
+		}
+
+		case "antigravity":
+		case "opencode":
 		case "gemini":
 		case "amp":
 		case "goose":
@@ -147,7 +305,7 @@ export function renderSubagentFilesForRuntime(
 				name,
 				description: subagent.manifest.description,
 				model: "inherit",
-				tools: subagent.manifest.tools,
+				tools: mapCanonicalToolsToRuntime(subagent.manifest.tools, target),
 			}).trim();
 			return [
 				{
@@ -160,10 +318,10 @@ export function renderSubagentFilesForRuntime(
 		}
 
 		case "vibe": {
-			const escapedDesc = JSON.stringify(subagent.manifest.description);
-			const escapedPrompt = JSON.stringify(constrainedBody);
+			const escapedDesc = encodeTomlBasicString(subagent.manifest.description);
+			const escapedPrompt = encodeTomlBasicString(constrainedBody);
 			const tomlDoc = [
-				`name = "${name}"`,
+				`name = ${encodeTomlBasicString(name)}`,
 				`description = ${escapedDesc}`,
 				`system_prompt = ${escapedPrompt}`,
 				"",
@@ -178,15 +336,25 @@ export function renderSubagentFilesForRuntime(
 			];
 		}
 
-		case "copilot":
+		case "copilot": {
+			const copilotTools = mapCanonicalToolsToRuntime(
+				subagent.manifest.tools,
+				"copilot",
+			);
+			const copilotFm = YAML.stringify({
+				name: subagent.manifest.name,
+				description: subagent.manifest.description,
+				tools: copilotTools,
+			}).trim();
 			return [
 				{
 					target,
 					itemName: name,
 					relativePath: `.github/agents/${name}.agent.md`,
-					content: normalizedDoc,
+					content: `---\n${copilotFm}\n---\n\n${constrainedBody}\n`,
 				},
 			];
+		}
 
 		case "cursor": {
 			const mdcFm = YAML.stringify({
