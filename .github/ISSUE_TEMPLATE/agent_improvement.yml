@@ -13,7 +13,7 @@ body:
         - "GitHub Copilot (.github/instructions/ & .github/agents/)"
         - "Google Antigravity (.agent/skills/ & .agent/agents/)"
         - "Google Gemini CLI (.gemini/skills/ & .gemini/agents/)"
-        - "OpenAI Codex CLI (.codex/skills/ & AGENTS.md)"
+        - "OpenAI Codex CLI (.agents/skills/, .codex/agents/ & AGENTS.md)"
         - "Windsurf / Cline / Roo Code / Kilo Code"
         - "Zed / Continue / Aider / AWS Kiro / Trae / Augment"
         - "Other Supported Target (Factory, Qwen, OpenCode, OpenHands, Amp, Goose, Warp, Crush, Vibe, Junie, Amazon Q, IDX)"

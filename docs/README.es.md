@@ -94,7 +94,7 @@ Cada archivo generado se rastrea en `.skillops-lock.json` con un resumen criptog
 | `copilot` | **GitHub Copilot** | `.github/instructions/skillops-<name>.instructions.md` | `.github/agents/<name>.agent.md` |
 | `antigravity` | **Google Antigravity IDE** | `.agent/skills/<name>/SKILL.md` | `.agent/agents/<name>.md` |
 | `windsurf` | **Windsurf AI IDE** | `.windsurf/rules/skillops-<name>.md` | `.windsurf/workflows/skillops-agent-<name>.md` |
-| `codex` | **OpenAI Codex CLI** | `.codex/skills/<name>/SKILL.md` + `AGENTS.md` | `.codex/agents/<name>.md` |
+| `codex` | **OpenAI Codex CLI** | `.agents/skills/<name>/SKILL.md` + `AGENTS.md` | `.codex/agents/<name>.toml` |
 | `gemini` | **Google Gemini CLI** | `.gemini/skills/<name>/SKILL.md` | `.gemini/agents/<name>.md` |
 | `cline` | **Cline** | `.clinerules/skillops-<name>.md` | `.clinerules/workflows/skillops-agent-<name>.md` |
 | `roocode` | **Roo Code** | `.roo/rules/skillops-<name>.md` | `.roo/rules-architect/skillops-agent-<name>.md` |
@@ -106,7 +106,7 @@ Cada archivo generado se rastrea en `.skillops-lock.json` con un resumen criptog
 | ID de Destino | IDE / CLI de IA | Ruta de Salida (Skills) | Ruta de Salida (Subagents) |
 | :--- | :--- | :--- | :--- |
 | `kilocode` | **Kilo Code** | `.kilocode/rules/skillops-<name>.md` | `.kilocode/workflows/skillops-agent-<name>.md` |
-| `zed` | **Zed AI** | `.zed/rules/skillops-<name>.md` | `.zed/rules/skillops-agent-<name>.md` |
+| `zed` | **Zed AI** | `.agents/skills/<name>/SKILL.md` | `.zed/agents/skillops-agent-<name>.md` |
 | `continue` | **Continue.dev** | `.continue/rules/skillops-<name>.md` | `.continue/prompts/skillops-agent-<name>.prompt` |
 | `aider` | **Aider** | `.aider/conventions/skillops-<name>.md` | `.aider/conventions/skillops-agent-<name>.md` |
 | `trae` | **Trae AI IDE** | `.trae/rules/skillops-<name>.md` | `.trae/agents/<name>.md` |
