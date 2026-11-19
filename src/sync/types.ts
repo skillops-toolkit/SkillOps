@@ -8,8 +8,9 @@ import {
 	scanTextForTrojanUnicode,
 	type SkillSecurityFinding,
 } from "../auditor/security.js";
-import type { RuntimeTarget } from "../models.js";
+import type { RuntimeTarget, SkillOpsConfig } from "../models.js";
 import type { CatalogIndex } from "./catalog-index.js";
+import type { WorkspaceTokenTelemetry } from "./telemetry.js";
 
 export interface AddOptions {
 	readonly catalogIndex?: CatalogIndex;
@@ -40,6 +41,7 @@ export type ArtifactHealthState =
 export interface StatusOptions {
 	readonly catalogIndex?: CatalogIndex;
 	readonly targets?: readonly RuntimeTarget[];
+	readonly config?: SkillOpsConfig | null;
 }
 
 export interface UpdateOptions {
@@ -77,6 +79,7 @@ export interface ProjectStatusReport {
 		readonly missing_on_disk: number;
 		readonly untracked_on_disk: number;
 	};
+	readonly token_telemetry?: WorkspaceTokenTelemetry;
 	readonly passed: boolean;
 }
 

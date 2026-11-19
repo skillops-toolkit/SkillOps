@@ -48,6 +48,10 @@ import {
 import { renderSkillFilesForRuntime } from "./renderers/skills.js";
 import { renderSubagentFilesForRuntime } from "./renderers/subagents.js";
 import {
+	computeLockfileL1Tokens,
+	computeWorkspaceTokenTelemetry,
+} from "./telemetry.js";
+import {
 	type AddOptions,
 	assertCustomCatalogSkillSafe,
 	assertCustomCatalogSubagentSafe,
@@ -192,6 +196,15 @@ export function inspectProjectStatus(
 		});
 	}
 
+	const tokenTelemetry = computeWorkspaceTokenTelemetry({
+		repoPath: resolvedRepo,
+		targets: [...activeTargets],
+		selectedSkills: [...installedSkills],
+		selectedSubagents: [...installedSubagents],
+		catalogIndex: catalogMaps,
+		config: options.config,
+	});
+
 	return {
 		repo_path: resolvedRepo.replace(/\\/g, "/"),
 		catalog_path: resolvedCatalog.replace(/\\/g, "/"),
@@ -202,6 +215,7 @@ export function inspectProjectStatus(
 		installed_subagents: [...installedSubagents],
 		artifacts,
 		counts,
+		token_telemetry: tokenTelemetry,
 		passed: counts.drift_modified === 0 && counts.missing_on_disk === 0,
 	};
 }
@@ -622,7 +636,11 @@ export function updateInstalledSkills(
 			targets: mergedTargets,
 			selected_skills: [...updatedSkills],
 			selected_subagents: [...updatedSubagents],
-			total_l1_tokens: existingLock?.total_l1_tokens ?? 0,
+			total_l1_tokens: computeLockfileL1Tokens(
+				[...updatedSkills],
+				[...updatedSubagents],
+				catalogMaps,
+			),
 			artifacts: newLockArtifacts,
 		});
 		writeLockfileAtomically(lockfilePath, lockData);

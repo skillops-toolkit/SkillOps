@@ -23,6 +23,7 @@ import {
 	stripManagedAiderReadEntries,
 } from "./aider-config.js";
 import { loadCatalogIndex } from "./catalog-index.js";
+import { computeLockfileL1Tokens } from "./telemetry.js";
 import {
 	collectInstalledCodexCatalogItems,
 	renderCodexAgentsIndex,
@@ -345,12 +346,27 @@ export function removeSkillOrSubagent(
 			? existingLock.selected_subagents
 			: existingLock.selected_subagents.filter((sa) => sa !== itemName);
 
+		let catalogMapsForTokens: ReturnType<typeof loadCatalogIndex> | undefined;
+		try {
+			catalogMapsForTokens =
+				options.catalogIndex &&
+				path.resolve(options.catalogIndex.catalogDir) === resolvedCatalog
+					? options.catalogIndex
+					: loadCatalogIndex(resolvedCatalog);
+		} catch {
+			catalogMapsForTokens = undefined;
+		}
 		const lockData: SyncLockfile = SyncLockfileSchema.parse({
 			...existingLock,
 			skillops_version: SKILLOPS_VERSION,
 			targets: updatedTargets,
 			selected_skills: updatedSkills,
 			selected_subagents: updatedSubagents,
+			total_l1_tokens: computeLockfileL1Tokens(
+				updatedSkills,
+				updatedSubagents,
+				catalogMapsForTokens,
+			),
 			artifacts: newLockArtifacts,
 		});
 		writeLockfileAtomically(lockfilePath, lockData);

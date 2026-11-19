@@ -41,6 +41,15 @@ export {
 	mapCanonicalToolsToRuntime,
 	renderSubagentFilesForRuntime,
 } from "./renderers/subagents.js";
+export {
+	computeLockfileL1Tokens,
+	computeWorkspaceTokenTelemetry,
+	DEFAULT_MAX_ALWAYS_ON_TOKENS,
+	type HarnessStartupMode,
+	isProgressiveHarness,
+	type TargetTokenTelemetry,
+	type WorkspaceTokenTelemetry,
+} from "./telemetry.js";
 export type {
 	AddOptions,
 	ArtifactHealthState,

@@ -1,4 +1,11 @@
 export {
+	DEFAULT_SEMANTIC_COLLISION_THRESHOLD,
+	detectSemanticCollisions,
+	extractPositiveTriggerText,
+	type SemanticCollisionPair,
+	type SemanticCollisionReport,
+} from "./collision.js";
+export {
 	discoverSkillDirectories,
 	discoverSubagentFiles,
 	type ParsedSkillDirectory,
