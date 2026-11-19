@@ -84,7 +84,16 @@ jobs:
           FORBIDDEN_OS_ATTRS = {
               "system", "popen", "spawnl", "spawnle", "spawnlp", "spawnlpe",
               "spawnv", "spawnve", "spawnvp", "spawnvpe", "posix_spawn", "posix_spawnp",
-              "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
+              "execl", "execle", "execlp", "execpe", "execlpe", "execv", "execve", "execvp", "execvpe",
+              "fork", "forkpty",
+          }
+          DANGEROUS_REFLECTION_ATTRS = FORBIDDEN_OS_ATTRS | {
+              "eval", "exec", "compile", "__import__", "__builtins__", "builtins",
+              "__globals__", "__subclasses__", "__loader__", "__spec__", "modules",
+              "urlopen", "urlretrieve", "open_code",
+          }
+          SENSITIVE_REFLECTION_TARGETS = {
+              "os", "posix", "nt", "sys", "builtins", "__builtins__", "urllib",
           }
           FORBIDDEN_BINARY_EXTS = {
               ".exe", ".dll", ".so", ".dylib", ".bin", ".wasm", ".pyc", ".pyo",
@@ -232,7 +241,19 @@ jobs:
                           elif fn_name == "compile" and (len(node.args) >= 3 or any(kw.arg == "mode" for kw in node.keywords)):
                               record_finding(rel_posix, lineno, "forbidden-dynamic-exec", digest, "forbidden dynamic compilation 'compile()'")
                           elif fn_name == "getattr":
-                              record_finding(rel_posix, lineno, "forbidden-dynamic-exec", digest, "forbidden reflection call 'getattr()'")
+                              target_names = {
+                                  sub.id
+                                  for arg in node.args[:1]
+                                  for sub in ast.walk(arg)
+                                  if isinstance(sub, ast.Name)
+                              }
+                              second_arg = node.args[1] if len(node.args) >= 2 else None
+                              attr_kw = next((kw.value for kw in node.keywords if kw.arg == "name"), None)
+                              attr_node = second_arg if second_arg is not None else attr_kw
+                              is_static_attr = isinstance(attr_node, ast.Constant) and isinstance(attr_node.value, str)
+                              attr_literal = attr_node.value if is_static_attr else ""
+                              if (target_names & SENSITIVE_REFLECTION_TARGETS) or (not is_static_attr) or (attr_literal in DANGEROUS_REFLECTION_ATTRS):
+                                  record_finding(rel_posix, lineno, "forbidden-dynamic-exec", digest, "forbidden dynamic attribute reflection 'getattr()'")
                       elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "os" and node.func.attr in FORBIDDEN_OS_ATTRS:
                           record_finding(rel_posix, lineno, "forbidden-shell-execution", digest, f"forbidden shell call 'os.{node.func.attr}()'")
                       for kw in node.keywords:
