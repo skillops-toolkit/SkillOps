@@ -28,14 +28,17 @@ import {
 } from "./discovery.js";
 import {
 	computeSha256,
+	isRegularFileNoFollow,
 	pruneEmptyParentDirs,
 	removeEmptyDirsRecursively,
 	resolveSafeRepoTargetPath,
 } from "./fs-safety.js";
 import {
+	assertAllowedHarnessArtifactPath,
 	createNullProtoArtifactsMap,
 	getLockArtifact,
 	loadExistingLockfile,
+	writeLockfileAtomically,
 } from "./lockfile.js";
 import { renderSkillFilesForRuntime } from "./renderers/skills.js";
 import { renderSubagentFilesForRuntime } from "./renderers/subagents.js";
@@ -133,9 +136,9 @@ export function inspectProjectStatus(
 
 	for (const d of discovered) {
 		const relPath = d.relativePath.replace(/\\/g, "/");
+		assertAllowedHarnessArtifactPath(d.target, relPath, d.itemName);
 		const fullPath = resolveSafeRepoTargetPath(resolvedRepo, relPath, canonicalRepo);
-		const fileExists =
-			fs.existsSync(fullPath) && fs.statSync(fullPath).isFile();
+		const fileExists = isRegularFileNoFollow(fullPath);
 		const diskSha256 = fileExists
 			? computeSha256(fs.readFileSync(fullPath, "utf-8"))
 			: null;
@@ -231,6 +234,7 @@ function resolveInstalledUpdateTuples(
 		resolvedRepo,
 		resolvedCatalog,
 		options.targets,
+		{ allowMalformedRecovery: options.force },
 	);
 	const requestedNames = options.names?.length
 		? [...new Set(options.names)]
@@ -277,7 +281,9 @@ export function updateInstalledSkills(
 	const force = options.force ?? false;
 	const canonicalRepo = fs.existsSync(resolvedRepo) ? fs.realpathSync(resolvedRepo) : null;
 	const lockfilePath = path.join(resolvedRepo, ".skillops-lock.json");
-	const existingLock = loadExistingLockfile(lockfilePath);
+	const existingLock = loadExistingLockfile(lockfilePath, {
+		allowMalformedRecovery: force,
+	});
 	const installedTuples = resolveInstalledUpdateTuples(
 		resolvedRepo,
 		resolvedCatalog,
@@ -350,9 +356,13 @@ export function updateInstalledSkills(
 				) {
 					continue;
 				}
+				assertAllowedHarnessArtifactPath(
+					tuple.target,
+					normOldRel,
+					tuple.itemName,
+				);
 				const safeOldPath = resolveSafeRepoTargetPath(resolvedRepo, normOldRel, canonicalRepo);
-				const oldExists =
-					fs.existsSync(safeOldPath) && fs.statSync(safeOldPath).isFile();
+				const oldExists = isRegularFileNoFollow(safeOldPath);
 				if (oldExists) {
 					const oldDiskSha = computeSha256(
 						fs.readFileSync(safeOldPath, "utf-8"),
@@ -394,10 +404,10 @@ export function updateInstalledSkills(
 
 		for (const pf of plannedFiles) {
 			const relPath = pf.relativePath.replace(/\\/g, "/");
+			assertAllowedHarnessArtifactPath(pf.target, relPath, pf.itemName);
 			const fullPath = resolveSafeRepoTargetPath(resolvedRepo, relPath, canonicalRepo);
 			const desiredSha = computeSha256(pf.content);
-			const fileExists =
-				fs.existsSync(fullPath) && fs.statSync(fullPath).isFile();
+			const fileExists = isRegularFileNoFollow(fullPath);
 			const lockEntry = getLockArtifact(existingLock?.artifacts, relPath);
 
 			if (fileExists) {
@@ -474,42 +484,60 @@ export function updateInstalledSkills(
 		(activeTargets.has("codex") || options.targets?.includes("codex")) &&
 		fs.existsSync(path.join(resolvedRepo, "AGENTS.md"))
 	) {
-		const safeAgentsMd = resolveSafeRepoTargetPath(resolvedRepo, "AGENTS.md");
-		if (fs.statSync(safeAgentsMd).isFile()) {
+		assertAllowedHarnessArtifactPath("codex", "AGENTS.md", "codex-agents-index");
+		const safeAgentsMd = resolveSafeRepoTargetPath(resolvedRepo, "AGENTS.md", canonicalRepo);
+		if (isRegularFileNoFollow(safeAgentsMd)) {
 			const existingAgentsMd = fs.readFileSync(safeAgentsMd, "utf-8");
-			const codexItems = collectInstalledCodexCatalogItems(
-				resolvedRepo,
-				resolvedCatalog,
-				null,
-				null,
-				catalogMaps,
-			);
-			const updatedAgentsMd = renderCodexAgentsIndex(
-				existingAgentsMd,
-				codexItems.skills,
-				codexItems.subagents,
-			);
-			const desiredAgentsSha = computeSha256(updatedAgentsMd);
 			const diskAgentsSha = computeSha256(existingAgentsMd);
+			const existingAgentsLock = getLockArtifact(existingLock?.artifacts, "AGENTS.md");
 			activeTargets.add("codex");
-			if (desiredAgentsSha !== diskAgentsSha) {
-				if (!dryRun) {
-					fs.writeFileSync(safeAgentsMd, updatedAgentsMd, "utf-8");
-				}
+			if (
+				existingAgentsLock &&
+				diskAgentsSha !== existingAgentsLock.sha256 &&
+				!force
+			) {
+				driftConflicts.push("AGENTS.md");
 				artifacts.push({
 					target: "codex",
 					skill_name: "codex-agents-index",
 					relative_path: "AGENTS.md",
-					sha256: desiredAgentsSha,
-					action: dryRun ? "planned" : "updated",
+					sha256: diskAgentsSha,
+					action: "conflict",
 				});
+				newLockArtifacts["AGENTS.md"] = existingAgentsLock;
+			} else {
+				const codexItems = collectInstalledCodexCatalogItems(
+					resolvedRepo,
+					resolvedCatalog,
+					null,
+					null,
+					catalogMaps,
+				);
+				const updatedAgentsMd = renderCodexAgentsIndex(
+					existingAgentsMd,
+					codexItems.skills,
+					codexItems.subagents,
+				);
+				const desiredAgentsSha = computeSha256(updatedAgentsMd);
+				if (desiredAgentsSha !== diskAgentsSha) {
+					if (!dryRun) {
+						fs.writeFileSync(safeAgentsMd, updatedAgentsMd, "utf-8");
+					}
+					artifacts.push({
+						target: "codex",
+						skill_name: "codex-agents-index",
+						relative_path: "AGENTS.md",
+						sha256: desiredAgentsSha,
+						action: dryRun ? "planned" : "updated",
+					});
+				}
+				newLockArtifacts["AGENTS.md"] = {
+					target: "codex",
+					skill_name: "codex-agents-index",
+					relative_path: "AGENTS.md",
+					sha256: desiredAgentsSha,
+				};
 			}
-			newLockArtifacts["AGENTS.md"] = {
-				target: "codex",
-				skill_name: "codex-agents-index",
-				relative_path: "AGENTS.md",
-				sha256: desiredAgentsSha,
-			};
 		}
 	}
 
@@ -529,11 +557,7 @@ export function updateInstalledSkills(
 			total_l1_tokens: existingLock?.total_l1_tokens ?? 0,
 			artifacts: newLockArtifacts,
 		});
-		fs.writeFileSync(
-			lockfilePath,
-			`${JSON.stringify(lockData, null, 2)}\n`,
-			"utf-8",
-		);
+		writeLockfileAtomically(lockfilePath, lockData);
 	}
 
 	const reportTargets =

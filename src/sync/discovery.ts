@@ -14,6 +14,8 @@ import {
 import {
 	collectFilesRecursively,
 	computeSha256,
+	isRealDirNoFollow,
+	isRegularFileNoFollow,
 	resolveSafeRepoTargetPath,
 } from "./fs-safety.js";
 import { loadExistingLockfile } from "./lockfile.js";
@@ -33,7 +35,7 @@ export function findExistingItemPathInTarget(
 ): string | null {
 	for (const pf of plannedForTarget) {
 		const fullPlanned = path.join(resolvedRepo, pf.relativePath);
-		if (fs.existsSync(fullPlanned) && fs.statSync(fullPlanned).isFile()) {
+		if (isRegularFileNoFollow(fullPlanned)) {
 			return pf.relativePath;
 		}
 	}
@@ -67,7 +69,7 @@ export function findExistingItemPathInTarget(
 
 	for (const relCandidate of candidates) {
 		const fullCandidate = path.join(resolvedRepo, relCandidate);
-		if (fs.existsSync(fullCandidate) && fs.statSync(fullCandidate).isFile()) {
+		if (isRegularFileNoFollow(fullCandidate)) {
 			return relCandidate;
 		}
 	}
@@ -75,16 +77,16 @@ export function findExistingItemPathInTarget(
 	if (kind === "skill") {
 		const skillFolderRel = `${spec.skillsDir}/${itemName}`;
 		const skillFolderFull = path.join(resolvedRepo, skillFolderRel);
-		if (
-			fs.existsSync(skillFolderFull) &&
-			fs.statSync(skillFolderFull).isDirectory()
-		) {
-			const entries = fs.readdirSync(skillFolderFull);
-			const firstFile = entries.find((entry) =>
-				fs.statSync(path.join(skillFolderFull, entry)).isFile(),
+		if (isRealDirNoFollow(skillFolderFull)) {
+			const entries = fs.readdirSync(skillFolderFull, { withFileTypes: true });
+			const firstFile = entries.find(
+				(entry) =>
+					!entry.isSymbolicLink() &&
+					entry.isFile() &&
+					isRegularFileNoFollow(path.join(skillFolderFull, entry.name)),
 			);
 			if (firstFile) {
-				return `${skillFolderRel}/${firstFile}`;
+				return `${skillFolderRel}/${firstFile.name}`;
 			}
 		}
 	}
@@ -123,8 +125,12 @@ export function discoverInstalledArtifactsOnDisk(
 	repoPath: string,
 	catalogDir: string,
 	targetFilter?: readonly RuntimeTarget[],
+	options: { allowMalformedRecovery?: boolean } = {},
 ): DiscoveredInstalledArtifact[] {
 	const resolvedRepo = path.resolve(repoPath);
+	const canonicalRepo = isRealDirNoFollow(resolvedRepo)
+		? fs.realpathSync(resolvedRepo)
+		: null;
 	const resolvedCatalog = path.resolve(catalogDir);
 	const candidateTargets: readonly RuntimeTarget[] =
 		targetFilter && targetFilter.length > 0
@@ -155,7 +161,9 @@ export function discoverInstalledArtifactsOnDisk(
 	}
 
 	const lockfilePath = path.join(resolvedRepo, ".skillops-lock.json");
-	const existingLock = loadExistingLockfile(lockfilePath);
+	const existingLock = loadExistingLockfile(lockfilePath, {
+		allowMalformedRecovery: options.allowMalformedRecovery,
+	});
 	for (const s of existingLock?.selected_skills ?? []) {
 		knownSkills.add(s);
 	}
@@ -208,6 +216,19 @@ export function discoverInstalledArtifactsOnDisk(
 		}
 	}
 
+	const isContainedRealDir = (relDir: string): string | null => {
+		try {
+			const safeFull = resolveSafeRepoTargetPath(
+				resolvedRepo,
+				relDir,
+				canonicalRepo,
+			);
+			return isRealDirNoFollow(safeFull) ? safeFull : null;
+		} catch {
+			return null;
+		}
+	};
+
 	const addDiskFile = (
 		target: RuntimeTarget,
 		itemName: string,
@@ -218,8 +239,17 @@ export function discoverInstalledArtifactsOnDisk(
 		if (byRelPath.has(normalizedRel)) {
 			return;
 		}
-		const fullPath = path.join(resolvedRepo, normalizedRel);
-		if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
+		let fullPath: string;
+		try {
+			fullPath = resolveSafeRepoTargetPath(
+				resolvedRepo,
+				normalizedRel,
+				canonicalRepo,
+			);
+		} catch {
+			return;
+		}
+		if (!isRegularFileNoFollow(fullPath)) {
 			return;
 		}
 		const sha256 = computeSha256(fs.readFileSync(fullPath, "utf-8"));
@@ -237,13 +267,13 @@ export function discoverInstalledArtifactsOnDisk(
 		const spec = RUNTIME_HARNESS_SPECS[target];
 
 		// 1. Scan skills directory for this target
-		const skillsDirFull = path.join(resolvedRepo, spec.skillsDir);
-		if (
-			fs.existsSync(skillsDirFull) &&
-			fs.statSync(skillsDirFull).isDirectory()
-		) {
+		const skillsDirFull = isContainedRealDir(spec.skillsDir);
+		if (skillsDirFull) {
 			const entries = fs.readdirSync(skillsDirFull, { withFileTypes: true });
 			for (const entry of entries) {
+				if (entry.isSymbolicLink()) {
+					continue;
+				}
 				const entryFull = path.join(skillsDirFull, entry.name);
 				if (entry.isDirectory()) {
 					// Ignore subagent subdirectories when skillsDir is a parent of subagentsDir (e.g. .clinerules/workflows)
@@ -251,6 +281,12 @@ export function discoverInstalledArtifactsOnDisk(
 						.relative(resolvedRepo, entryFull)
 						.replace(/\\/g, "/");
 					if (relDir === spec.subagentsDir) {
+						continue;
+					}
+					if (
+						!knownSkills.has(entry.name) &&
+						!entry.name.startsWith("skillops-")
+					) {
 						continue;
 					}
 					const nestedFiles = collectFilesRecursively(entryFull, resolvedRepo);
@@ -331,15 +367,12 @@ export function discoverInstalledArtifactsOnDisk(
 
 		// Copilot also writes .github/prompts/skillops-<name>.prompt.md for skills
 		if (target === "copilot") {
-			const copilotPromptsDir = path.join(resolvedRepo, ".github", "prompts");
-			if (
-				fs.existsSync(copilotPromptsDir) &&
-				fs.statSync(copilotPromptsDir).isDirectory()
-			) {
+			const copilotPromptsDir = isContainedRealDir(".github/prompts");
+			if (copilotPromptsDir) {
 				for (const entry of fs.readdirSync(copilotPromptsDir, {
 					withFileTypes: true,
 				})) {
-					if (!entry.isFile()) continue;
+					if (entry.isSymbolicLink() || !entry.isFile()) continue;
 					const m =
 						/^skillops-(.+)\.prompt\.md$/.exec(entry.name) ??
 						/^(.+)\.prompt\.md$/.exec(entry.name);
@@ -355,14 +388,11 @@ export function discoverInstalledArtifactsOnDisk(
 		}
 
 		// 2. Scan subagents directory for this target
-		const subagentsDirFull = path.join(resolvedRepo, spec.subagentsDir);
-		if (
-			fs.existsSync(subagentsDirFull) &&
-			fs.statSync(subagentsDirFull).isDirectory()
-		) {
+		const subagentsDirFull = isContainedRealDir(spec.subagentsDir);
+		if (subagentsDirFull) {
 			const entries = fs.readdirSync(subagentsDirFull, { withFileTypes: true });
 			for (const entry of entries) {
-				if (!entry.isFile()) {
+				if (entry.isSymbolicLink() || !entry.isFile()) {
 					continue;
 				}
 				const fileName = entry.name;
@@ -378,7 +408,11 @@ export function discoverInstalledArtifactsOnDisk(
 				}
 
 				const copilotAgentMatch = /^(.+)\.agent\.md$/.exec(fileName);
-				if (copilotAgentMatch?.[1]) {
+				if (
+					copilotAgentMatch?.[1] &&
+					(fileName.startsWith("skillops-") ||
+						knownSubagents.has(copilotAgentMatch[1]))
+				) {
 					addDiskFile(target, copilotAgentMatch[1], "subagent", relFile);
 					continue;
 				}
@@ -389,7 +423,7 @@ export function discoverInstalledArtifactsOnDisk(
 					);
 					if (
 						directMatch?.[1] &&
-						!fileName.startsWith("skillops-") &&
+						knownSubagents.has(directMatch[1]) &&
 						fileName.toLowerCase() !== "readme.md"
 					) {
 						addDiskFile(target, directMatch[1], "subagent", relFile);

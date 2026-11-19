@@ -12,25 +12,54 @@ function trimTrailingSlashes(val: string): string {
 }
 
 export function computeSha256(content: string): string {
-	return crypto.createHash("sha256").update(content, "utf-8").digest("hex");
+	return crypto
+		.createHash("sha256")
+		.update(content.replace(/\r\n/g, "\n"), "utf-8")
+		.digest("hex");
+}
+
+/** Check via lstatSync that `filePath` is an existing regular file and NOT a symbolic link. */
+export function isRegularFileNoFollow(filePath: string): boolean {
+	try {
+		const stat = fs.lstatSync(filePath);
+		return !stat.isSymbolicLink() && stat.isFile();
+	} catch {
+		return false;
+	}
+}
+
+/** Check via lstatSync that `dirPath` is an existing real directory and NOT a symbolic link. */
+export function isRealDirNoFollow(dirPath: string): boolean {
+	try {
+		const stat = fs.lstatSync(dirPath);
+		return !stat.isSymbolicLink() && stat.isDirectory();
+	} catch {
+		return false;
+	}
 }
 
 export function collectFilesRecursively(
 	dirFullPath: string,
 	resolvedRepo: string,
 ): string[] {
-	if (!fs.existsSync(dirFullPath) || !fs.statSync(dirFullPath).isDirectory()) {
+	if (!isRealDirNoFollow(dirFullPath)) {
 		return [];
 	}
 	const results: string[] = [];
 	const entries = fs.readdirSync(dirFullPath, { withFileTypes: true });
 	for (const entry of entries) {
+		if (entry.isSymbolicLink()) {
+			continue;
+		}
 		if (entry.isFile()) {
 			const fullEntry = path.join(dirFullPath, entry.name);
 			results.push(path.relative(resolvedRepo, fullEntry).replace(/\\/g, "/"));
 		}
 	}
 	for (const entry of entries) {
+		if (entry.isSymbolicLink()) {
+			continue;
+		}
 		if (entry.isDirectory()) {
 			const fullEntry = path.join(dirFullPath, entry.name);
 			results.push(...collectFilesRecursively(fullEntry, resolvedRepo));
@@ -40,10 +69,13 @@ export function collectFilesRecursively(
 }
 
 export function removeEmptyDirsRecursively(dirFullPath: string): void {
-	if (!fs.existsSync(dirFullPath) || !fs.statSync(dirFullPath).isDirectory()) {
+	if (!isRealDirNoFollow(dirFullPath)) {
 		return;
 	}
 	for (const entry of fs.readdirSync(dirFullPath, { withFileTypes: true })) {
+		if (entry.isSymbolicLink()) {
+			continue;
+		}
 		if (entry.isDirectory()) {
 			removeEmptyDirsRecursively(path.join(dirFullPath, entry.name));
 		}
