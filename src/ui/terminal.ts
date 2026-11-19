@@ -8,41 +8,26 @@
  */
 
 import { SKILLOPS_VERSION } from "../models.js";
-import { CHARM_PALETTE, fgHex, renderPill } from "./lipgloss.js";
+import {
+	CHARM_PALETTE,
+	type ColorOverrideOptions,
+	fgHex,
+	isColorEnabled,
+	padVisible,
+	renderPill,
+	stripAnsi,
+	visibleLength,
+} from "./palette.js";
+
+export {
+	type ColorOverrideOptions,
+	isColorEnabled,
+	padVisible,
+	stripAnsi,
+	visibleLength,
+};
 
 const ESC = String.fromCharCode(27);
-const ANSI_ESCAPE_REGEX = new RegExp(`${ESC}\\[[0-9;]*m`, "g");
-
-export interface ColorOverrideOptions {
-	readonly env?: NodeJS.ProcessEnv;
-	readonly isTTY?: boolean;
-}
-
-/**
- * Determine whether ANSI terminal colors should be emitted.
- * Respects https://no-color.org (`NO_COLOR`), `FORCE_COLOR`, `TERM=dumb`, and `stdout.isTTY`.
- */
-export function isColorEnabled(options?: ColorOverrideOptions): boolean {
-	const env = options?.env ?? process.env;
-	const isTTY = options?.isTTY ?? Boolean(process.stdout?.isTTY);
-
-	if (env.NO_COLOR !== undefined && env.NO_COLOR !== "") {
-		return false;
-	}
-	if (env.FORCE_COLOR !== undefined) {
-		const val = env.FORCE_COLOR.trim().toLowerCase();
-		if (val === "0" || val === "false") {
-			return false;
-		}
-		if (val === "1" || val === "2" || val === "3" || val === "true") {
-			return true;
-		}
-	}
-	if (env.TERM === "dumb") {
-		return false;
-	}
-	return isTTY;
-}
 
 function wrapAnsi(
 	openCode: string,
@@ -83,44 +68,6 @@ export const style = {
 	white: (text: string, enabled?: boolean): string =>
 		fgHex(CHARM_PALETTE.white, text, enabled),
 };
-
-/**
- * Strip all ANSI SGR escape sequences from a string.
- */
-export function stripAnsi(text: string): string {
-	return text.replace(ANSI_ESCAPE_REGEX, "");
-}
-
-/**
- * Compute visible character width of a string ignoring ANSI color codes.
- */
-export function visibleLength(text: string): number {
-	return Array.from(stripAnsi(text)).length;
-}
-
-/**
- * Pad a potentially ANSI-styled string to a target visible width.
- */
-export function padVisible(
-	text: string,
-	width: number,
-	align: "left" | "right" | "center" = "left",
-): string {
-	const len = visibleLength(text);
-	if (len >= width) {
-		return text;
-	}
-	const diff = width - len;
-	if (align === "right") {
-		return `${" ".repeat(diff)}${text}`;
-	}
-	if (align === "center") {
-		const left = Math.floor(diff / 2);
-		const right = diff - left;
-		return `${" ".repeat(left)}${text}${" ".repeat(right)}`;
-	}
-	return `${text}${" ".repeat(diff)}`;
-}
 
 export interface BoxOptions {
 	readonly title?: string;
