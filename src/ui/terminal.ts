@@ -515,6 +515,7 @@ export const DEFAULT_VALID_COMMANDS: readonly string[] = [
 	"rm",
 	"audit",
 	"doctor",
+	"completions",
 ];
 
 /**

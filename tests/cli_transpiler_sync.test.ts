@@ -313,18 +313,18 @@ describe("Track 2 — CLI Audit, Help Invariants, Security & 28-IDE Transpiler S
 		);
 		expect(builtinJson.security_findings).toEqual([]);
 
-		// Alias 'doctor' with markdown output
-		const doctorRes = captureCliRun([
+		// 'audit' with markdown output
+		const auditMdRes = captureCliRun([
 			"node",
 			"skillops",
-			"doctor",
+			"audit",
 			"--catalog",
 			BUILTIN_CATALOG_DIR,
 			"-f",
 			"markdown",
 		]);
-		expect(doctorRes.code).toBe(ExitCode.SUCCESS);
-		expect(doctorRes.stdout).toContain("## SkillOps Catalog & Security Audit Report");
+		expect(auditMdRes.code).toBe(ExitCode.SUCCESS);
+		expect(auditMdRes.stdout).toContain("## SkillOps Catalog & Security Audit Report");
 
 		// Custom catalog without evals/evals.json: passes non-strict, fails --strict with ExitCode.BUDGET_OR_CONTRACT_ERROR (3)
 		const layoutCatalog = makeTempDir("skillops-audit-layout-");
@@ -412,7 +412,7 @@ describe("Track 2 — CLI Audit, Help Invariants, Security & 28-IDE Transpiler S
 		const auditSpec = findCommandHelpSpec("audit");
 		const doctorSpec = findCommandHelpSpec("doctor");
 		expect(auditSpec).toBeDefined();
-		expect(doctorSpec?.name).toBe("audit");
+		expect(doctorSpec?.name).toBe("doctor");
 		const auditHelp = stripAnsi(renderCommandHelp(auditSpec!, "1.5.2", false));
 		expect(auditHelp).toContain("--strict");
 		expect(auditHelp).toContain("--catalog");
